@@ -1,0 +1,40 @@
+﻿name: Report SSH Gateway Integration Results
+
+on:
+  workflow_run:
+    workflows: [ 'SSH Gateway Integration Test' ]
+    types: [ completed ]
+
+permissions:
+  actions: read
+  issues: write
+  contents: read
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 5
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+  report:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+      - name: Report integration outcome
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'SSH Gateway Integration Results';
+            const body = `SSH Gateway Integration run (id: ${run.id}) concluded with **${run.conclusion}**. [View run](${run.html_url}).\n\nCommit: ${run.head_commit.id} - ${run.head_commit.message}`;
+            const issues = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 });
+            let issue = issues.data.find(i => i.title === title);
+            if (issue) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }

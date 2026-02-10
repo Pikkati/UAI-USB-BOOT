@@ -1,0 +1,56 @@
+﻿name: Enforce Local-Only Runners
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 * * * *' # hourly enforcement
+  workflow_dispatch:
+
+jobs:
+  check-hosted-runners:
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Find hosted runner usages across repo
+        id: find
+        run: |
+          set -euo pipefail
+          echo "Searching for hosted runner usages across repository (looking for ubuntu-latest/windows-latest/macos-latest or runs-on: *-latest)..."
+          matches=$(grep -nH -E "runs-on:\\s*.*-latest|ubuntu-latest|windows-latest|macos-latest" -R . --exclude='.github/workflows/workflows-local-enforce.yml' --exclude-dir='.git' || true)
+          if [ -n "$matches" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "$matches" > hosted_matches.txt
+            echo "::error::Found hosted runner usage in repository:"
+            echo "$matches"
+            exit 1
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "✅ No hosted runner usage found in repository"
+          fi
+
+      - name: Create issue for hosted-runner occurrences
+        if: steps.find.outputs.found == 'true'
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const matches = fs.readFileSync('hosted_matches.txt','utf8') || '';
+            const title = "CI: Hosted-runner usage detected — migrate to self-hosted";
+            const body = `The enforcement workflow detected hosted runner references. Please migrate these to ` + "`self-hosted`" + ` runners or remove hosted-runner labels to avoid incurring GitHub-hosted minutes.\n\n\`\`\`\n${matches}\n\`\`\`\n\n**Recommended:** Use \`runs-on: [self-hosted, docker-swarm]\` and ensure at least one runner is online.`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 });
+            const existing = issues.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body: `Enforcement re-run detected hosted-runner occurrences at ${new Date().toISOString()}:\n\n${matches}` });
+              console.log('Updated existing issue #' + existing.number);
+            } else {
+              const newIssue = await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title: title, body });
+              console.log('Created issue #' + newIssue.data.number);
+            }
+
+      - name: Summary
+        if: steps.find.outputs.found == 'false'
+        run: echo "All workflows are configured to use self-hosted runners."

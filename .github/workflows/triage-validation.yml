@@ -1,0 +1,43 @@
+﻿name: Cascade Triage Validation
+true:
+  workflow_dispatch: {}
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  validate:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    name: Validate triage script (manual)
+    steps:
+    - name: Checkout
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - name: Run triage script against a stable endpoint (httpbin)
+      run: 'pwsh -NoProfile -Command "& ''./ops/triage/cascade_triage.ps1'' -Endpoints
+        @(''https://httpbin.org/status/200'') -OutputDir ''./triage-test-output''
+        -PrometheusUrl ''''"
+
+        '
+    - name: List triage output
+      run: ls -la triage-test-output || true
+    - name: Notify Slack on failure
+      if: ${{ failure() }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: 'if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "No SLACK_WEBHOOK_URL configured;
+        skipping slack notification"; exit 0; fi
+
+        PAYLOAD="{\"text\":\"[UAI] Manual triage validation failed in ${GITHUB_REPOSITORY}
+        (<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|run
+        ${GITHUB_RUN_ID}>)\"}"
+
+        curl -s -X POST -H ''Content-type: application/json'' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+        || true
+
+        '
+    needs:
+    - credit_check

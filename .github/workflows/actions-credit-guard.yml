@@ -1,0 +1,40 @@
+name: Actions Credit Guard
+
+on:
+  workflow_call:
+    inputs:
+      estimated_minutes:
+        required: false
+        type: number
+        default: 5
+      threshold_percent:
+        required: false
+        type: number
+        default: 3
+      fallback_runner:
+        required: false
+        type: string
+        default: '["self-hosted","docker-swarm"]'
+    outputs:
+      runner:
+        description: 'JSON array of runner labels to use for subsequent jobs'
+      run_on_swarm:
+        description: 'true if using swarm'
+      reason:
+        description: 'reason for decision'
+
+jobs:
+  check:
+    # Force self-hosted to avoid consuming any GitHub-hosted minutes (account exceeded).
+    runs-on: ["self-hosted","docker-swarm"]
+    outputs:
+      runner: ${{ steps.set.outputs.runner }}
+      run_on_swarm: ${{ steps.set.outputs.run_on_swarm }}
+      reason: ${{ steps.set.outputs.reason }}
+    steps:
+      - name: Force self-hosted runners (GH minutes exceeded)
+        id: set
+        run: |
+          echo "runner=[\"self-hosted\",\"docker-swarm\"]" >> "$GITHUB_OUTPUT"
+          echo "run_on_swarm=true" >> "$GITHUB_OUTPUT"
+          echo "reason=gh_hosted_disabled" >> "$GITHUB_OUTPUT"

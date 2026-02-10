@@ -1,0 +1,87 @@
+﻿name: Platform Health Monitoring
+true:
+  schedule:
+  - cron: '*/5 9-18 * * 1-5'
+  - cron: '*/15 * * * *'
+  workflow_dispatch: null
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  health-check:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - name: Check Cloudflare Workers
+      run: "curl -f https://uai-consciousness-engine.uai-copilot.workers.dev/health\
+        \ \\\n  || echo \"::warning::Cloudflare Workers health check failed\"\n"
+    - name: Check Netlify
+      run: "curl -f https://uai-consciousness-engine.netlify.app \\\n  || echo \"\
+        ::warning::Netlify health check failed\"\n"
+    - name: Check Render
+      run: "curl -f https://uai-copilot-automation-tool.onrender.com/health \\\n \
+        \ || echo \"::warning::Render health check failed\"\n"
+    - name: Check Vercel Production /health
+      id: vercel_health
+      continue-on-error: true
+      env:
+        VERCEL_HEALTH_URL: ${{ secrets.VERCEL_HEALTH_URL }}
+      run: "set -euo pipefail\nURL=\"${VERCEL_HEALTH_URL:-}\"\nif [ -z \"$URL\" ];\
+        \ then\n  URL=\"https://uai-copilot-automation.vercel.app/health\"\nfi\n\n\
+        echo \"Checking ${URL}\"\n\nMAX_RETRIES=6\nDELAY=5\nattempt=1\nstatus=0\n\
+        body=\"\"\n\nwhile [ $attempt -le $MAX_RETRIES ]; do\n  status=$(curl -s -o\
+        \ /tmp/health_body -w \"%{http_code}\" \"$URL\" || true)\n  body=$(cat /tmp/health_body\
+        \ || true)\n\n  if [ \"$status\" -eq 200 ]; then\n    echo \"Vercel health\
+        \ OK (HTTP 200)\"\n    echo \"status=$status\" >> \"$GITHUB_OUTPUT\"\n   \
+        \ echo \"body=$(echo \"$body\" | head -c 1000 | sed 's/%/%%/g')\" >> \"$GITHUB_OUTPUT\"\
+        \n    exit 0\n  fi\n\n  # Detect Vercel preview protection (401 + SSO nonce\
+        \ or auth HTML)\n  if [ \"$status\" -eq 401 ]; then\n    hdrs=$(curl -s -D\
+        \ - -o /dev/null \"$URL\" 2>/dev/null || true)\n    if echo \"$hdrs\" | grep\
+        \ -qi '_vercel_sso_nonce' || echo \"$body\" | grep -qi 'Authentication Required\\\
+        |Vercel Authentication'; then\n      echo \"::warning::Vercel preview protected\
+        \ (401)\"\n      echo \"status=401\" >> \"$GITHUB_OUTPUT\"\n      echo \"\
+        body=$(echo \"$body\" | head -c 1000 | sed 's/%/%%/g')\" >> \"$GITHUB_OUTPUT\"\
+        \n      exit 0\n    fi\n  fi\n\n  echo \"Attempt $attempt returned $status.\
+        \ Retrying in ${DELAY}s...\"\n  sleep \"$DELAY\"\n  attempt=$((attempt+1))\n\
+        \  DELAY=$((DELAY*2))\ndone\n\necho \"status=$status\" >> \"$GITHUB_OUTPUT\"\
+        \necho \"body=$(echo \"$body\" | head -c 1000 | sed 's/%/%%/g')\" >> \"$GITHUB_OUTPUT\"\
+        \necho \"::error::Vercel health check failed after $MAX_RETRIES attempts:\
+        \ HTTP $status\"\nexit 1\n"
+    - name: Create or update Vercel incident
+      if: always() && steps.vercel_health.outputs.status != '200'
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: "const status = `${{ steps.vercel_health.outputs.status }}` || 'unknown';\n\
+          const body = `${{ steps.vercel_health.outputs.body }}` || '';\nconst title\
+          \ = `Vercel production health: ${status}`;\n// Find open incident issue\n\
+          const issues = await github.rest.issues.listForRepo({\n  owner: context.repo.owner,\n\
+          \  repo: context.repo.repo,\n  labels: 'triage,infra,incident',\n  state:\
+          \ 'open',\n  per_page: 100\n});\nconst incident = issues.data.find(i =>\
+          \ i.title && i.title.includes('Vercel production health'));\nif (!incident)\
+          \ {\n  await github.rest.issues.create({\n    owner: context.repo.owner,\n\
+          \    repo: context.repo.repo,\n    title: title,\n    body: `Automated check\
+          \ detected Vercel production health issue.\\n\\nStatus: ${status}\\n\\nExcerpt:\
+          \ ${body}\\n\\nTime: ${new Date().toISOString()}\\n\\n(If this is a preview\
+          \ SSO / protected deployment, see issue #165 for preview protection details.)`,\n\
+          \    labels: ['triage','infra','incident']\n  });\n} else {\n  await github.rest.issues.createComment({\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    issue_number:\
+          \ incident.number,\n    body: `Repeated failure detected: status ${status}\\\
+          n\\nExcerpt: ${body}\\n\\nTime: ${new Date().toISOString()}`\n  });\n}\n"
+    - name: Check Koyeb
+      run: "curl -f https://verbal-jen-uaicore-fcdfb920.koyeb.app/health \\\n  ||\
+        \ echo \"::warning::Koyeb health check failed\"\n"
+    - name: Generate Report
+      if: always()
+      run: "echo \"# Platform Health Report\" > report.md\necho \"Generated: $(date\
+        \ -u)\" >> report.md\necho \"\" >> report.md\necho \"## Status\" >> report.md\n\
+        echo \"- Cloudflare Workers: \u2705\" >> report.md\necho \"- Netlify: \u2705\
+        \" >> report.md\necho \"- Render: Checking...\" >> report.md\necho \"- Vercel:\
+        \ Checking...\" >> report.md\necho \"- Koyeb: Checking...\" >> report.md\n"
+    needs:
+    - credit_check

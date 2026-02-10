@@ -1,0 +1,74 @@
+﻿name: Key Vault Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'Run mode: read-only (default) or manage (creates and deletes a secret).'
+        required: false
+        default: 'read-only'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  keyvault-integration:
+    name: Key Vault integration (manual)
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    timeout-minutes: 20
+    env:
+      KV_TEST_VAULT: ${{ secrets.KV_TEST_VAULT }}
+      KV_TEST_SECRET_NAME: ${{ secrets.KV_TEST_SECRET_NAME }}
+      KV_TEST_SECRET_VALUE: ${{ secrets.KV_TEST_SECRET_VALUE }}
+      KV_TEST_MANAGE: ${{ secrets.KV_TEST_MANAGE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c
+        with:
+          python-version: '3.12'
+
+      - name: Verify configuration
+        run: |
+          if [ -z "${KV_TEST_VAULT}" ]; then
+            echo "Missing repository secret: KV_TEST_VAULT"; exit 1
+          fi
+          if [ -z "${KV_TEST_SECRET_NAME}" ]; then
+            echo "Missing repository secret: KV_TEST_SECRET_NAME"; exit 1
+          fi
+
+      - name: Login to Azure (service principal)
+        uses: azure/login@cb79c773a3cfa27f31f25eb3f677781210c9ce3d
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export AZURE_* env vars from AZURE_CREDENTIALS
+        run: |
+          echo "AZURE_CLIENT_ID=$(jq -r .clientId <<< \"$AZURE_CREDENTIALS\")" >> $GITHUB_ENV
+          echo "AZURE_CLIENT_SECRET=$(jq -r .clientSecret <<< \"$AZURE_CREDENTIALS\")" >> $GITHUB_ENV
+          echo "AZURE_TENANT_ID=$(jq -r .tenantId <<< \"$AZURE_CREDENTIALS\")" >> $GITHUB_ENV
+          echo "AZURE_SUBSCRIPTION_ID=$(jq -r .subscriptionId <<< \"$AZURE_CREDENTIALS\")" >> $GITHUB_ENV
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest azure-identity azure-keyvault-secrets
+
+      - name: Run Key Vault integration tests
+        run: |
+          pytest -q tests/test_keyvault_integration.py -m "integration and network" --maxfail=1 -q

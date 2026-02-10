@@ -1,0 +1,311 @@
+# UAI System CI/CD Pipeline
+# =========================
+#
+# This GitHub Actions workflow provides automated testing,
+# building, deployment, and monitoring for the UAI Copilot
+# Automation Tool.
+
+name: UAI System CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily health checks at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 40
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  # ========================================
+  # 🔍 CODE QUALITY & TESTING
+  # ========================================
+  quality-check:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov bandit safety mypy
+
+      - name: Run security checks
+        run: |
+          bandit -r . -f json -o security_report.json || true
+          safety check --output json > safety_report.json || true
+
+      - name: Run type checking
+        run: |
+          mypy . --ignore-missing-imports || true
+
+      - name: Run tests
+        run: |
+          pytest --cov=. --cov-report=xml --cov-report=html
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@ab904c41d6ece82784817410c45d8b8c02684457
+        with:
+          file: ./coverage.xml
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: security-reports
+          path: |
+            security_report.json
+            safety_report.json
+
+  # ========================================
+  # 🐳 BUILD & PUSH DOCKER IMAGES
+  # ========================================
+  build-and-push:
+    needs: [quality-check, credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+
+  # ========================================
+  # 🚀 DEPLOYMENT
+  # ========================================
+  deploy:
+    needs: [build-and-push, credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@d4b9b8ff72958532804b70bbe600ad43b36d5f2e
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy to production
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd /opt/uai-system
+            echo "Pulling latest changes..."
+            git pull origin main
+
+            echo "Updating Docker images..."
+            docker-compose pull
+
+            echo "Running database migrations..."
+            docker-compose run --rm uai-core-api python manage.py migrate
+
+            echo "Deploying services..."
+            docker-compose up -d --scale worker-node=2
+
+            echo "Running health checks..."
+            sleep 30
+            python system_health_check.py
+
+            echo "Cleaning up..."
+            docker system prune -f
+          EOF
+
+  # ========================================
+  # 🔍 HEALTH MONITORING
+  # ========================================
+  health-check:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run health check
+        run: |
+          python system_health_check.py
+        env:
+          UAI_MASTER_URL: ${{ secrets.UAI_MASTER_URL }}
+          UAI_API_KEY: ${{ secrets.UAI_API_KEY }}
+
+      - name: Send health report
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🚨 UAI System Health Check Failed\\nRepository: ${{ github.repository }}\\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ========================================
+  # 📊 PERFORMANCE MONITORING
+  # ========================================
+  performance-test:
+    needs: [deploy, credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c
+        with:
+          python-version: '3.11'
+
+      - name: Install load testing tools
+        run: |
+          pip install locust requests
+
+      - name: Run performance tests
+        run: |
+          # Create a simple load test
+          cat > load_test.py << 'EOF'
+          from locust import HttpUser, task, between
+
+          class UAIUser(HttpUser):
+              wait_time = between(1, 3)
+
+              @task
+              def health_check(self):
+                  self.client.get("/health")
+
+              @task
+              def api_status(self):
+                  self.client.get("/api/v1/status")
+          EOF
+
+          locust -f load_test.py --headless -u 10 -r 2 --run-time 30s --host ${{ secrets.UAI_MASTER_URL }}
+
+      - name: Generate performance report
+        run: |
+          python monitoring_dashboard.py
+          echo "Performance test completed"
+
+  # ========================================
+  # 🔄 ROLLBACK
+  # ========================================
+  rollback:
+    needs: [deploy, credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    if: failure() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@d4b9b8ff72958532804b70bbe600ad43b36d5f2e
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Rollback deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd /opt/uai-system
+            echo "Rolling back to previous version..."
+
+            # Get previous commit
+            PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+
+            echo "Checking out previous commit: $PREVIOUS_COMMIT"
+            git checkout $PREVIOUS_COMMIT
+
+            echo "Redeploying previous version..."
+            docker-compose down
+            docker-compose up -d
+
+            echo "Running health checks..."
+            sleep 30
+            python system_health_check.py
+
+            echo "Rollback completed"
+          EOF
+
+      - name: Send rollback notification
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🔄 UAI System Rollback Completed\\nRepository: ${{ github.repository }}\\nRolled back to previous version"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }}

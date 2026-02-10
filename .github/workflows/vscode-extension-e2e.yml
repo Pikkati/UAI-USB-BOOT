@@ -1,0 +1,175 @@
+name: VS Code Extension E2E Tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'vscode-extension/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'vscode-extension/**'
+  workflow_dispatch:
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 15
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  vscode-extension-e2e:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        include:
+          - browser: chromium
+            display_name: Chrome
+          - browser: firefox
+            display_name: Firefox
+          - browser: webkit
+            display_name: Safari
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: vscode-extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./vscode-extension
+      run: npm ci
+
+    - name: Install Playwright browsers
+      working-directory: ./vscode-extension
+      run: npx playwright install --with-deps
+
+    - name: Build extension
+      working-directory: ./vscode-extension
+      run: npm run build
+
+    - name: Run E2E test pipeline
+      working-directory: ./vscode-extension
+      run: npm run e2e:pipeline
+      env:
+        CI: true
+        BROWSER: ${{ matrix.browser }}
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: e2e-test-results-${{ matrix.browser }}
+        path: |
+          vscode-extension/test-results/
+          vscode-extension/benchmarks/
+          vscode-extension/playwright-report/
+          vscode-extension/reports/
+
+    - name: Upload test screenshots
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: e2e-screenshots-${{ matrix.browser }}
+        path: vscode-extension/test-results/screenshots/
+
+  performance-benchmarks:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    needs: [credit_check, vscode-extension-e2e]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: vscode-extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./vscode-extension
+      run: npm ci
+
+    - name: Install Playwright browsers
+      working-directory: ./vscode-extension
+      run: npx playwright install --with-deps
+
+    - name: Build extension
+      working-directory: ./vscode-extension
+      run: npm run build
+
+    - name: Run performance benchmarks
+      working-directory: ./vscode-extension
+      run: npm run benchmark
+      env:
+        CI: true
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-benchmarks
+        path: vscode-extension/benchmarks/
+
+  notify-results:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    needs: [credit_check, vscode-extension-e2e, performance-benchmarks]
+    if: always()
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Generate test summary
+      run: |
+        echo "## E2E Test Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Check if test results exist
+        if [ -d "vscode-extension/test-results" ]; then
+          echo "### Test Status" >> $GITHUB_STEP_SUMMARY
+          if [ -f "vscode-extension/test-results/e2e-results.json" ]; then
+            echo "✅ E2E tests completed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ E2E tests failed or incomplete" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
+        # Check benchmark results
+        if [ -d "vscode-extension/benchmarks" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Performance Benchmarks" >> $GITHUB_STEP_SUMMARY
+          if [ -f "vscode-extension/benchmarks/benchmark-report.json" ]; then
+            echo "✅ Performance benchmarks completed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Performance benchmarks not available" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
+        # Add links to artifacts
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "- [Test Results](./artifacts)" >> $GITHUB_STEP_SUMMARY
+        echo "- [Playwright Report](./artifacts/playwright-report/index.html)" >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify on failure
+      if: failure()
+      run: |
+        echo "E2E tests failed. Check the artifacts for detailed results."
+      shell: bash

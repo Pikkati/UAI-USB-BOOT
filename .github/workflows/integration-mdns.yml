@@ -1,0 +1,159 @@
+﻿name: "Integration — mDNS Safe Test (self-hosted)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "Set to '1' to run the workflow (safety gate)"
+        required: false
+        default: '0'
+      dev:
+        description: "Set to '1' to install developer deps (pytest-cov, etc.)"
+        required: false
+        default: '0'
+  pull_request:
+    types: [labeled, opened, synchronize, reopened]
+
+jobs:
+  mdns-integration:
+    # Run only when explicitly requested (manual dispatch with run=1) or when a PR is labeled 'run-integration' or 'run-integration-dev'
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.run == '1') || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'run-integration') || contains(github.event.pull_request.labels.*.name, 'run-integration-dev'))) }}
+    name: mDNS integration (self-hosted)
+    runs-on: [self-hosted, linux, x86_64]
+    environment: integration
+    timeout-minutes: 60
+
+    steps:
+      - name: Runner sanity check
+        run: |
+          echo "Runner: $(uname -a)"
+          for cmd in python3 make git; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              echo "$cmd is required on runner"
+              exit 1
+            fi
+          done
+          # ensure python venv support
+          if ! python3 -m venv --help >/dev/null 2>&1; then
+            echo "Python venv support required (python3 -m venv)"
+            exit 1
+          fi
+
+      - name: Checkout repository (manual)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          # Initialize repo if necessary, then fetch and checkout the commit
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          fi
+          git fetch --depth=1 origin ${{ github.sha }} || git fetch origin
+          git checkout -f ${{ github.sha }}
+
+      - name: Prepare pip cache directory
+        run: |
+          set -euo pipefail
+          PIP_CACHE_DIR="$HOME/.cache/pip"
+          echo "Creating pip cache dir: $PIP_CACHE_DIR"
+          mkdir -p "$PIP_CACHE_DIR"
+          chmod 0755 "$PIP_CACHE_DIR" || true
+          # Export for subsequent steps
+          echo "PIP_CACHE_DIR=$PIP_CACHE_DIR" >> $GITHUB_ENV
+
+      - name: Create virtualenv & install integration deps (Makefile)
+        run: |
+          set -euo pipefail
+          echo "Event: ${{ github.event_name }}"
+          # Ensure PIP_CACHE_DIR defaults to $HOME/.cache/pip if not set by previous step
+          PIP_CACHE_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
+          echo "Using pip cache dir: $PIP_CACHE_DIR"
+          # Use dev deps when workflow_dispatch input dev==1 or PR labeled 'run-integration-dev'
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dev }}" = "1" ]; then
+            echo "Installing developer dependencies (venv-dev)"
+            PIP_CACHE_DIR="$PIP_CACHE_DIR" make -C integration venv-dev
+          elif [ "${{ github.event_name }}" = "pull_request" ] && echo "${{ toJson(github.event.pull_request.labels.*.name) }}" | grep -q '"run-integration-dev"'; then
+            echo "Installing developer dependencies (venv-dev) due to PR label"
+            PIP_CACHE_DIR="$PIP_CACHE_DIR" make -C integration venv-dev
+          else
+            echo "Installing standard integration dependencies (venv)"
+            PIP_CACHE_DIR="$PIP_CACHE_DIR" make -C integration venv
+          fi
+
+      - name: Install package
+        run: |
+          . .venv-integration/bin/activate
+          pip install -e .
+
+      - name: Run mDNS safe integration test
+        env:
+          PYTHONWARNINGS: ignore
+        run: |
+          set -euo pipefail
+          # Run pytest and capture output to mdns-test.log (preserve exit code)
+          bash -lc '. .venv-integration/bin/activate && pytest -q swarm_autojoin/tests/integration/test_mdns_http.py -q | tee mdns-test.log; rc=${PIPESTATUS[0]:-$?}; exit $rc'
+
+      - name: Collect mDNS artifacts
+        if: failure()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts || true
+          echo "[info] saving pytest log"
+          if [ -f mdns-test.log ]; then cp mdns-test.log artifacts/ || true; fi
+          echo "[info] pip freeze"
+          . .venv-integration/bin/activate && pip freeze > artifacts/pip-freeze.txt || true
+          python -m pip show zeroconf > artifacts/zeroconf-info.txt || true
+          uname -a > artifacts/uname.txt || true
+          date > artifacts/date.txt || true
+
+      - name: Upload mDNS artifacts
+        if: failure()
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: mdns-artifacts-${{ github.run_id }}
+          path: artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Pip cache size
+        if: always()
+        run: |
+          set -euo pipefail
+          PIP_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
+          echo "[info] PIP cache dir: $PIP_DIR"
+          if [ -d "$PIP_DIR" ]; then
+            echo "[info] size and top entries:"
+            du -sh "$PIP_DIR" || true
+            echo "[info] top files (by size):"
+            # Show top 20 largest files under the cache (best-effort)
+            find "$PIP_DIR" -type f -printf '%s %p\n' 2>/dev/null | sort -nr | head -n 20 || true
+          else
+            echo "[info] PIP cache dir does not exist"
+          fi
+
+      - name: Pip cache summary (success only)
+        if: success()
+        run: |
+          set -euo pipefail
+          PIP_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
+          echo "[success] PIP cache dir: $PIP_DIR"
+          if [ -d "$PIP_DIR" ]; then
+            du -sh "$PIP_DIR" || true
+          fi
+
+      - name: Upload mdns-test log (success only)
+        if: success()
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: mdns-test-log-${{ github.run_id }}
+          path: mdns-test.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Collector (debug on failure)
+        if: failure()
+        run: |
+          echo "[debug] show last 200 lines of syslog/journal (if available)"
+          journalctl -n 200 || true

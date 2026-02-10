@@ -1,0 +1,51 @@
+﻿name: Vercel Production Deployment
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type CONFIRM to run Vercel production deploy'
+        required: true
+        default: 'DECLINE'
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.confirm == 'CONFIRM' }}
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    environment: production
+    steps:
+    - name: Checkout
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - name: Install Vercel CLI
+      run: npm install --global vercel@latest
+    - name: Verify Vercel token & project access
+      run: |
+        echo "Verifying Vercel token and project access..."
+        out=$(vercel whoami --token=${{ secrets.VERCEL_TOKEN }} 2>&1 || true)
+        echo "$out"
+        if echo "$out" | grep -qi "not logged in\|Not authenticated\|Unauthorized"; then
+          echo "::error::VERCEL_TOKEN is invalid or cannot authenticate. Create or update token and save as VERCEL_TOKEN."
+          exit 1
+        fi
+        proj_out=$(vercel projects inspect ${{ secrets.VERCEL_PROJECT_ID }} --token=${{ secrets.VERCEL_TOKEN }} 2>&1 || true)
+        echo "$proj_out"
+        if echo "$proj_out" | grep -qi "not found\|You do not have permission"; then
+          echo "::error::Vercel token user does not have access to the project or project not found. Make sure the token belongs to a user with access to the target Vercel team/project and the secrets VERCEL_PROJECT_ID/VERCEL_ORG_ID are correct."
+          exit 1
+        fi
+    - name: Pull Vercel Environment Information
+      run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+    - name: Build Project Artifacts
+      run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+    - name: Deploy Project Artifacts to Vercel
+      run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+    needs:
+    - credit_check

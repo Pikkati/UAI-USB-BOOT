@@ -1,0 +1,69 @@
+﻿name: Auto-merge remediation on Issue
+true:
+  issue_comment:
+    types:
+    - created
+concurrency:
+  group: auto-merge-issue-116
+  cancel-in-progress: true
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  auto-merge:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+    - name: Auto-merge remediation PR when Issue
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: "const core = require('@actions/core');\nconst issueNumber = context.issue.number;\n\
+          if (issueNumber !== 116) {\n  core.info(`Comment on issue ${issueNumber}\
+          \ ignored.`);\n  return;\n}\n\nconst comment = context.payload.comment;\n\
+          if (!comment || !comment.body) {\n  core.info('No comment body, aborting.');\n\
+          \  return;\n}\n\nconst body = comment.body.toLowerCase();\nif (!body.includes('merge-now'))\
+          \ {\n  core.info('No trigger phrase \"merge-now\" found in comment; exiting.');\n\
+          \  return;\n}\n\n// Check issue labels\nconst issueData = (await github.rest.issues.get({\n\
+          \  owner: context.repo.owner,\n  repo: context.repo.repo,\n  issue_number:\
+          \ issueNumber\n})).data;\nconst labels = issueData.labels.map(l => (typeof\
+          \ l === 'string') ? l : l.name);\nconst requiredLabels = ['rotation-confirmed',\
+          \ 'security-approved'];\nconst missing = requiredLabels.filter(l => !labels.includes(l));\n\
+          \n// Check commenter permissions (collaborator with admin/write/maintain\
+          \ OR repo owner 'yushchyr')\nconst commenter = comment.user.login;\nlet\
+          \ permitted = false;\ntry {\n  const resp = await github.rest.repos.getCollaboratorPermissionLevel({\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    username:\
+          \ commenter\n  });\n  const perm = resp.data.permission || '';\n  if (['admin','write','maintain'].includes(perm))\
+          \ permitted = true;\n} catch (err) {\n  core.info(`Permission check returned\
+          \ error (user may not be a collaborator): ${err.message}`);\n}\nif (missing.length\
+          \ > 0 && !permitted && commenter !== 'yushchyr') {\n  core.setFailed(`Missing\
+          \ labels: ${missing.join(', ')} and commenter ${commenter} not authorized.\
+          \ Aborting.`);\n  return;\n}\n\n// Locate open PR for the remediation branch\n\
+          const headRef = `${context.repo.owner}:remediation/remove-committed-secrets-2026-01-04`;\n\
+          const { data: prs } = await github.rest.pulls.list({\n  owner: context.repo.owner,\n\
+          \  repo: context.repo.repo,\n  state: 'open',\n  head: headRef\n});\nif\
+          \ (!prs || prs.length === 0) {\n  core.setFailed(`No open PR found for head\
+          \ ${headRef}`);\n  return;\n}\n\nconst prNumber = prs[0].number;\ncore.info(`Merging\
+          \ PR #${prNumber} (head ${headRef})...`);\ntry {\n  const mergeResp = await\
+          \ github.rest.pulls.merge({\n    owner: context.repo.owner,\n    repo: context.repo.repo,\n\
+          \    pull_number: prNumber,\n    merge_method: 'merge'\n  });\n  if (mergeResp.data\
+          \ && mergeResp.data.merged) {\n    await github.rest.issues.createComment({\n\
+          \      owner: context.repo.owner,\n      repo: context.repo.repo,\n    \
+          \  issue_number: issueNumber,\n      body: `Automated merge: PR #${prNumber}\
+          \ merged by automation in response to comment by @${commenter}.`\n    });\n\
+          \    await github.rest.issues.addLabels({\n      owner: context.repo.owner,\n\
+          \      repo: context.repo.repo,\n      issue_number: issueNumber,\n    \
+          \  labels: ['merged-by-automation']\n    });\n    core.info(`PR #${prNumber}\
+          \ merged successfully`);\n  } else {\n    core.setFailed(`Merge API returned\
+          \ merged=false: ${JSON.stringify(mergeResp.data)}`);\n  }\n} catch (err)\
+          \ {\n  core.setFailed(`Merge failed: ${err.message}`);\n}"
+    needs:
+    - credit_check

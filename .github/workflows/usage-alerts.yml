@@ -1,0 +1,237 @@
+﻿name: GitHub Actions Usage Alerts
+
+concurrency:
+  group: usage-alerts
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # Every 4 hours
+  workflow_dispatch:
+    inputs:
+      alert_level:
+        description: 'Alert level to test (warning, critical, emergency)'
+        required: false
+        type: choice
+        options:
+          - warning
+          - critical
+          - emergency
+
+jobs:
+  check_usage_alerts:
+    runs-on: [self-hosted]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Preflight checks
+        id: preflight
+        run: |
+          echo "Running preflight checks..."
+          allowed=true
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "SLACK_WEBHOOK_URL not set. Disabling this run."
+            allowed=false
+          fi
+          if [ "${{ secrets.SLACK_ENABLED }}" = "false" ]; then
+            echo "SLACK_ENABLED=false. Disabling monitoring run."
+            allowed=false
+          fi
+          echo "allowed=${allowed}" >> $GITHUB_OUTPUT
+
+      - name: Check Usage and Send Alerts
+        if: ${{ steps.preflight.outputs.allowed == 'true' }}
+        id: alerts
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            const core = require('@actions/core');
+
+            try {
+              // Get billing data
+              const billing = await github.request(
+                'GET /orgs/{org}/settings/billing/actions',
+                { org: context.repo.owner }
+              );
+
+              const included = billing.data.included_minutes;
+              const used = billing.data.total_minutes_used;
+              const remaining = included - used;
+              const percentage = (used / included) * 100;
+
+              core.setOutput('percentage', percentage.toFixed(2));
+              core.setOutput('remaining', remaining);
+              core.setOutput('used', used);
+
+              // Determine alert level
+              let alertLevel = 'normal';
+              let alertMessage = '';
+              let alertColor = 'good';
+
+              if (percentage >= 95) {
+                alertLevel = 'emergency';
+                alertMessage = `🚨 EMERGENCY: ${percentage.toFixed(1)}% of GitHub Actions minutes used! Only ${remaining} minutes remaining.`;
+                alertColor = 'danger';
+              } else if (percentage >= 85) {
+                alertLevel = 'critical';
+                alertMessage = `🔴 CRITICAL: ${percentage.toFixed(1)}% of GitHub Actions minutes used. ${remaining} minutes remaining.`;
+                alertColor = 'danger';
+              } else if (percentage >= 75) {
+                alertLevel = 'warning';
+                alertMessage = `🟡 WARNING: ${percentage.toFixed(1)}% of GitHub Actions minutes used. ${remaining} minutes remaining.`;
+                alertColor = 'warning';
+              }
+
+              // Check if manual alert test was requested
+              const manualAlert = process.env.INPUT_ALERT_LEVEL;
+              if (manualAlert) {
+                alertLevel = manualAlert;
+                alertMessage = `🧪 TEST ALERT: ${manualAlert.toUpperCase()} - ${percentage.toFixed(1)}% used, ${remaining} minutes remaining.`;
+              }
+
+              core.setOutput('alert_level', alertLevel);
+              core.setOutput('alert_message', alertMessage);
+              core.setOutput('alert_color', alertColor);
+
+              // Log alert decision
+              console.log(`Alert Level: ${alertLevel}`);
+              console.log(`Message: ${alertMessage}`);
+
+            } catch (err) {
+              core.warning(`Billing API error: ${err.message}`);
+              core.setOutput('alert_level', 'error');
+              core.setOutput('alert_message', 'Unable to check GitHub Actions usage - API error');
+              core.setOutput('alert_color', 'danger');
+            }
+
+      - name: Send Slack Alert
+        if: ${{ steps.preflight.outputs.allowed == 'true' && steps.alerts.outputs.alert_level != 'normal' && steps.alerts.outputs.alert_level != 'error' }}
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            MESSAGE="${{ steps.alerts.outputs.alert_message }}"
+            COLOR="${{ steps.alerts.outputs.alert_color }}"
+
+            # Create Slack message payload
+            PAYLOAD=$(cat <<EOF
+            {
+              "attachments": [
+                {
+                  "color": "$COLOR",
+                  "title": "GitHub Actions Usage Alert",
+                  "text": "$MESSAGE",
+                  "fields": [
+                    {
+                      "title": "Repository",
+                      "value": "${{ github.repository }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Check Dashboard",
+                      "value": "https://yushchyr.github.io/UAI_Copilot_Automation_Tool/dashboard/",
+                      "short": true
+                    }
+                  ],
+                  "footer": "GitHub Actions Monitor",
+                  "ts": $(date +%s)
+                }
+              ]
+            }
+          EOF
+          )
+
+            echo "Sending Slack alert..."
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Slack notification failed"
+          else
+            echo "Slack webhook not configured - skipping notification"
+          fi
+
+      - name: Send Email Alert (Fallback)
+        if: ${{ steps.preflight.outputs.allowed == 'true' && steps.alerts.outputs.alert_level == 'emergency' }}
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "EMERGENCY: GitHub Actions usage at ${{ steps.alerts.outputs.percentage }}%"
+            echo "Only ${{ steps.alerts.outputs.remaining }} minutes remaining!"
+            echo ""
+            echo "Check dashboard: https://yushchyr.github.io/UAI_Copilot_Automation_Tool/dashboard/"
+            echo ""
+            echo "Immediate action required to prevent workflow failures."
+          else
+            echo "Slack webhook configured - email fallback skipped."
+          fi
+
+      - name: Create GitHub Issue for Critical Alerts
+        if: ${{ steps.preflight.outputs.allowed == 'true' && steps.alerts.outputs.alert_level == 'emergency' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            const issueTitle = `🚨 GitHub Actions Emergency: ${process.env.PERCENTAGE}% Usage`;
+            const issueBody = `
+            ## 🚨 GitHub Actions Usage Emergency
+
+            **Current Usage:** ${process.env.PERCENTAGE}%
+            **Minutes Remaining:** ${process.env.REMAINING}
+            **Minutes Used:** ${process.env.USED}
+
+            ### Immediate Actions Required:
+            - Review high-frequency workflows
+            - Consider disabling non-critical CI/CD
+            - Monitor usage dashboard: https://yushchyr.github.io/UAI_Copilot_Automation_Tool/dashboard/
+            - Consider upgrading GitHub plan if usage continues to grow
+
+            ### Automated Response:
+            All workflows are configured to fall back to self-hosted swarm runners when minutes are low.
+
+            ---
+            *Alert generated automatically by usage monitoring system*
+            `;
+
+            // Check if issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['emergency', 'github-actions-usage'],
+              state: 'open'
+            });
+
+            if (existingIssues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['emergency', 'github-actions-usage', 'automation']
+              });
+            }
+        env:
+          PERCENTAGE: ${{ steps.alerts.outputs.percentage }}
+          REMAINING: ${{ steps.alerts.outputs.remaining }}
+          USED: ${{ steps.alerts.outputs.used }}
+
+      - name: Generate Alert Summary
+        if: ${{ steps.preflight.outputs.allowed == 'true' }}
+        run: |
+          echo "## 🚨 GitHub Actions Usage Alert" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Usage Percentage | ${{ steps.alerts.outputs.percentage }}% | ${{ steps.alerts.outputs.alert_level }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Minutes Remaining | ${{ steps.alerts.outputs.remaining }} | $([ ${{ steps.alerts.outputs.remaining }} -lt 1000 ] && echo '⚠️ LOW' || echo '✅ OK') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Minutes Used | ${{ steps.alerts.outputs.used }} | - |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.alerts.outputs.alert_level }}" != "normal" ]; then
+            echo "### 📢 Alert Actions Taken:" >> $GITHUB_STEP_SUMMARY
+            echo "- Slack notification sent" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.alerts.outputs.alert_level }}" = "emergency" ]; then
+              echo "- Emergency GitHub issue created" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "- All workflows configured for swarm fallback" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Dashboard: https://yushchyr.github.io/UAI_Copilot_Automation_Tool/dashboard/*" >> $GITHUB_STEP_SUMMARY
+          echo "*Last checked: $(date)*" >> $GITHUB_STEP_SUMMARY

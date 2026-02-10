@@ -1,0 +1,56 @@
+﻿name: Large File Precheck
+true:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+  push:
+    branches-ignore:
+    - main
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  large_file_check:
+    name: Large-file Precheck
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0
+    - name: Set up Python
+      uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c
+      with:
+        python-version: '3.11'
+    - name: Compute changed files
+      shell: bash
+      run: "set -eux\nmkdir -p artifacts\nCHANGED=changed_files.txt\necho \"\" > $CHANGED\n\
+        if [ \"${{ github.event_name }}\" = \"pull_request\" ]; then\n  BASE=\"${{\
+        \ github.event.pull_request.base.ref }}\"\n  echo \"Pull request: comparing\
+        \ to ${BASE}\"\n  git fetch origin ${BASE} --depth=1 || true\n  git diff --name-only\
+        \ origin/${BASE}...HEAD -z | tr '\\0' '\\n' > \"$CHANGED\" || true\nelse\n\
+        \  echo \"Push event: comparing to origin/main\"\n  git fetch origin main\
+        \ --depth=1 || true\n  git diff --name-only origin/main...HEAD -z | tr '\\\
+        0' '\\n' > \"$CHANGED\" || true\nfi\necho \"Changed files list (first 200\
+        \ lines):\"\nhead -n 200 \"$CHANGED\" || true\n"
+    - name: Run large-file precheck
+      shell: bash
+      run: "# if no changed files detected, skip the check\nif [ ! -s changed_files.txt\
+        \ ]; then\n  echo \"No changed files detected; skipping precheck.\"\n  exit\
+        \ 0\nfi\npython scripts/check_large_files.py --threshold 100 --files-file\
+        \ changed_files.txt --output artifacts/large_file_report.json\n"
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+      with:
+        name: large-file-report
+        path: artifacts/large_file_report.json
+    needs:
+    - credit_check

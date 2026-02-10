@@ -1,0 +1,51 @@
+﻿name: E2E Deploy Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, docker-swarm]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Prepare environment
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq npm curl || true
+
+      - name: Run E2E Deploy Test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_DISPATCH_TOKEN: ${{ secrets.WORKFLOW_DISPATCH_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          bash ci/run_e2e_deploy_test.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: e2e-deploy-results
+          path: e2e_deploy_results.json
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            const body = `E2E deploy test failed on run: ${process.env.GITHUB_RUN_URL}\n\nCheck attached artifacts for details: e2e-deploy-results\n\nIf dispatch failed, add a PAT named WORKFLOW_DISPATCH_TOKEN with 'repo' + 'workflow' scopes and repository access.`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "CI: E2E deploy test failure — investigate and remediate",
+              body
+            });

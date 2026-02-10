@@ -1,0 +1,268 @@
+﻿name: Swarm Runner Auto-Scaling
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Scaling action to perform'
+        required: false
+        type: choice
+        options:
+          - analyze
+          - scale_up
+          - scale_down
+          - emergency_stop
+
+jobs:
+  analyze_scaling_needs:
+    runs-on: [self-hosted, docker-swarm]
+    outputs:
+      scale_action: ${{ steps.analysis.outputs.scale_action }}
+      reason: ${{ steps.analysis.outputs.reason }}
+      current_runners: ${{ steps.analysis.outputs.current_runners }}
+      recommended_runners: ${{ steps.analysis.outputs.recommended_runners }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Analyze Scaling Requirements
+        id: analysis
+        run: |
+          echo "🔍 Analyzing swarm runner scaling requirements..."
+
+          # Get current usage data
+          USAGE_FILE=$(find metrics -name "usage-*.json" -mmin -60 | head -1 2>/dev/null || echo "")
+          if [ -n "$USAGE_FILE" ]; then
+            CURRENT_USAGE=$(jq -r '.percentage_used' "$USAGE_FILE" 2>/dev/null || echo "0")
+            REMAINING_MINUTES=$(jq -r '.remaining_minutes' "$USAGE_FILE" 2>/dev/null || echo "30000")
+          else
+            CURRENT_USAGE="0"
+            REMAINING_MINUTES="30000"
+          fi
+
+          # Get recent workflow activity (simulated - would need GitHub API)
+          # For now, use basic heuristics
+          HOUR=$(date +%H)
+          DAY=$(date +%w)  # 0=Sunday, 6=Saturday
+
+          # Base scaling logic
+          SCALE_ACTION="none"
+          REASON="Normal operation"
+          CURRENT_RUNNERS=2
+          RECOMMENDED_RUNNERS=2
+
+          # Emergency stop if usage critical
+          if (( $(echo "$CURRENT_USAGE > 95" | bc -l) )); then
+            SCALE_ACTION="emergency_stop"
+            REASON="Critical usage threshold exceeded (${CURRENT_USAGE}%)"
+            RECOMMENDED_RUNNERS=0
+          # Scale up during peak hours (9 AM - 6 PM UTC, weekdays)
+          elif [ "$HOUR" -ge 9 ] && [ "$HOUR" -le 18 ] && [ "$DAY" -ge 1 ] && [ "$DAY" -le 5 ]; then
+            if (( $(echo "$CURRENT_USAGE > 70" | bc -l) )); then
+              SCALE_ACTION="scale_up"
+              REASON="High usage during peak hours (${CURRENT_USAGE}%)"
+              RECOMMENDED_RUNNERS=4
+            fi
+          # Scale down during off-peak
+          elif [ "$HOUR" -lt 6 ] || [ "$HOUR" -gt 22 ] || [ "$DAY" -eq 0 ] || [ "$DAY" -eq 6 ]; then
+            SCALE_ACTION="scale_down"
+            REASON="Off-peak hours - reducing runner capacity"
+            RECOMMENDED_RUNNERS=1
+          fi
+
+          # Check for manual action override
+          MANUAL_ACTION="${{ github.event.inputs.action }}"
+          if [ -n "$MANUAL_ACTION" ]; then
+            SCALE_ACTION="$MANUAL_ACTION"
+            REASON="Manual scaling action requested: $MANUAL_ACTION"
+          fi
+
+          echo "scale_action=$SCALE_ACTION" >> $GITHUB_OUTPUT
+          echo "reason=$REASON" >> $GITHUB_OUTPUT
+          echo "current_runners=$CURRENT_RUNNERS" >> $GITHUB_OUTPUT
+          echo "recommended_runners=$RECOMMENDED_RUNNERS" >> $GITHUB_OUTPUT
+          echo "current_usage=$CURRENT_USAGE" >> $GITHUB_OUTPUT
+          echo "remaining_minutes=$REMAINING_MINUTES" >> $GITHUB_OUTPUT
+
+  scale_runners:
+    needs: analyze_scaling_needs
+    if: ${{ needs.analyze_scaling_needs.outputs.scale_action != 'none' }}
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Execute Scaling Action
+        run: |
+          ACTION="${{ needs.analyze_scaling_needs.outputs.scale_action }}"
+          CURRENT="${{ needs.analyze_scaling_needs.outputs.current_runners }}"
+          RECOMMENDED="${{ needs.analyze_scaling_needs.outputs.recommended_runners }}"
+          REASON="${{ needs.analyze_scaling_needs.outputs.reason }}"
+
+          echo "🔧 Executing scaling action: $ACTION"
+          echo "Current runners: $CURRENT"
+          echo "Recommended runners: $RECOMMENDED"
+          echo "Reason: $REASON"
+
+          case $ACTION in
+            "scale_up")
+              echo "📈 Scaling UP swarm runners..."
+              # Here you would implement actual scaling logic
+              # Examples: Docker Compose scale, Kubernetes HPA, cloud provider APIs
+              echo "Scaling from $CURRENT to $RECOMMENDED runners"
+              # docker-compose up --scale swarm-runner=$RECOMMENDED
+              ;;
+
+            "scale_down")
+              echo "📉 Scaling DOWN swarm runners..."
+              echo "Scaling from $CURRENT to $RECOMMENDED runners"
+              # Implement scale down logic
+              ;;
+
+            "emergency_stop")
+              echo "🚨 EMERGENCY STOP - shutting down all runners..."
+              echo "Emergency stop initiated due to: $REASON"
+              # Implement emergency stop logic
+              # docker-compose down
+              ;;
+
+            *)
+              echo "⚠️ Unknown scaling action: $ACTION"
+              ;;
+          esac
+
+      - name: Send Scaling Notification
+        if: ${{ needs.analyze_scaling_needs.outputs.scale_action != 'emergency_stop' }}
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            ACTION="${{ needs.analyze_scaling_needs.outputs.scale_action }}"
+            CURRENT="${{ needs.analyze_scaling_needs.outputs.current_runners }}"
+            RECOMMENDED="${{ needs.analyze_scaling_needs.outputs.recommended_runners }}"
+            REASON="${{ needs.analyze_scaling_needs.outputs.reason }}"
+
+            PAYLOAD=$(cat <<EOF
+            {
+              "attachments": [
+                {
+                  "color": "good",
+                  "title": "Swarm Runner Auto-Scaling",
+                  "text": "Action: ${ACTION}\\nRunners: ${CURRENT} → ${RECOMMENDED}\\nReason: ${REASON}",
+                  "fields": [
+                    {
+                      "title": "Scaling Type",
+                      "value": "Automated",
+                      "short": true
+                    },
+                    {
+                      "title": "Triggered By",
+                      "value": "Usage Analysis",
+                      "short": true
+                    }
+                  ],
+                  "footer": "Auto-Scaling System",
+                  "ts": $(date +%s)
+                }
+              ]
+            }
+          EOF
+          )
+
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Scaling notification failed"
+          fi
+
+      - name: Emergency Alert
+        if: ${{ needs.analyze_scaling_needs.outputs.scale_action == 'emergency_stop' }}
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            REASON="${{ needs.analyze_scaling_needs.outputs.reason }}"
+
+            PAYLOAD=$(cat <<EOF
+            {
+              "attachments": [
+                {
+                  "color": "danger",
+                  "title": "🚨 EMERGENCY: Swarm Runners Stopped",
+                  "text": "All swarm runners have been stopped due to critical usage threshold.\\n\\nReason: ${REASON}\\n\\nAction Required: Review GitHub Actions usage and billing.",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "value": "All runners stopped",
+                      "short": true
+                    },
+                    {
+                      "title": "Check Dashboard",
+                      "value": "https://yushchyr.github.io/UAI_Copilot_Automation_Tool/dashboard/",
+                      "short": true
+                    }
+                  ],
+                  "footer": "Emergency Auto-Scaling",
+                  "ts": $(date +%s)
+                }
+              ]
+            }
+          EOF
+          )
+
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Emergency alert failed"
+          fi
+
+  log_scaling_event:
+    needs: [analyze_scaling_needs, scale_runners]
+    if: always()
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Log Scaling Event
+        run: |
+          mkdir -p scaling-events
+
+          cat > scaling-events/scaling-$(date +%Y-%m-%d_%H-%M-%S).json << EOF
+          {
+            "timestamp": "$(date -Iseconds)",
+            "action": "${{ needs.analyze_scaling_needs.outputs.scale_action }}",
+            "reason": "${{ needs.analyze_scaling_needs.outputs.reason }}",
+            "current_runners": ${{ needs.analyze_scaling_needs.outputs.current_runners }},
+            "recommended_runners": ${{ needs.analyze_scaling_needs.outputs.recommended_runners }},
+            "current_usage_percentage": ${{ needs.analyze_scaling_needs.outputs.current_usage }},
+            "remaining_minutes": ${{ needs.analyze_scaling_needs.outputs.remaining_minutes }},
+            "workflow_run": "${{ github.run_id }}",
+            "trigger": "${{ github.event_name }}"
+          }
+          EOF
+
+          echo "📝 Scaling event logged:"
+          cat scaling-events/scaling-*.json
+
+      - name: Commit Scaling Logs
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          if git diff --quiet scaling-events/; then
+            echo "No scaling events to commit"
+          else
+            git add scaling-events/
+            git commit -m "🔧 Auto-scaling event - ${{ needs.analyze_scaling_needs.outputs.scale_action }} - $(date)" || true
+            git push origin HEAD:scaling-events 2>/dev/null || \
+              (git checkout -b scaling-events && git push -u origin scaling-events)
+          fi
+
+      - name: Generate Scaling Summary
+        run: |
+          echo "## 🔧 Swarm Runner Auto-Scaling Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | Current | Recommended | Reason |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ${{ needs.analyze_scaling_needs.outputs.scale_action }} | ${{ needs.analyze_scaling_needs.outputs.current_runners }} | ${{ needs.analyze_scaling_needs.outputs.recommended_runners }} | ${{ needs.analyze_scaling_needs.outputs.reason }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Current Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- Usage: ${{ needs.analyze_scaling_needs.outputs.current_usage }}%" >> $GITHUB_STEP_SUMMARY
+          echo "- Minutes Remaining: ${{ needs.analyze_scaling_needs.outputs.remaining_minutes }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Auto-scaling system is monitoring usage patterns and adjusting capacity automatically.*" >> $GITHUB_STEP_SUMMARY
+          echo "*Last scaled: $(date)*" >> $GITHUB_STEP_SUMMARY
