@@ -35,7 +35,7 @@ dependencies = [
     "unstructured==0.18.31",
     "azure-identity==1.15.0",
     "azure-keyvault-secrets==4.10.0",
-    "azure-storage-blob==12.17.0",
+    "azure-storage-blob==12.28.0",
     "redis==7.1.0",
     "psutil==5.9.6",
     "docusign-esign==6.0.0",
