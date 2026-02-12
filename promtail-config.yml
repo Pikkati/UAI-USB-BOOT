@@ -1,0 +1,72 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: varlogs
+          __path__: /var/log/*log
+    pipeline_stages:
+      - match:
+          selector: '{job="varlogs"}'
+          stages:
+            - regex:
+                expression: '^(?P<time>\w+ \d+ \d+:\d+:\d+) (?P<host>\w+) (?P<process>\w+)\[(?P<pid>\d+)\]: (?P<message>.*)$'
+            - labels:
+                time:
+                host:
+                process:
+                pid:
+
+  - job_name: docker
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: docker
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            time: time
+            stream: stream
+            log: log
+      - labels:
+          stream:
+      - timestamp:
+          format: RFC3339Nano
+          source: time
+      - output:
+          source: log
+
+  - job_name: uai-application
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: uai-app
+          __path__: /app/logs/*.log
+    pipeline_stages:
+      - match:
+          selector: '{job="uai-app"}'
+          stages:
+            - regex:
+                expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) (?P<level>\w+) (?P<logger>[\w\.]+) - (?P<message>.*)$'
+            - labels:
+                level:
+                logger:
+            - timestamp:
+                format: '2006-01-02 15:04:05,000'
+                source: timestamp
+            - output:
+                source: message
