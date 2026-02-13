@@ -1,5 +1,3 @@
-version: '3.8'
-
 #==============================================================================
 # UAI Platform Docker Compose Configuration
 # Complete platform stack with monitoring, storage, and orchestration

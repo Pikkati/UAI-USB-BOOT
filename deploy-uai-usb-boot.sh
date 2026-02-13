@@ -292,6 +292,13 @@ verify_deployment() {
         warning "API health check failed - may still be starting"
     fi
 
+    # Run comprehensive validation
+    if [[ -f "$SCRIPT_DIR/validate-deployment.sh" ]]; then
+        log "Running comprehensive validation..."
+        chmod +x "$SCRIPT_DIR/validate-deployment.sh"
+        "$SCRIPT_DIR/validate-deployment.sh"
+    fi
+
     success "Deployment verification complete"
 }
 
