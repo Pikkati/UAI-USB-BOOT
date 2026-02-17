@@ -9,8 +9,9 @@ to /v1/services/{service}/deploys to trigger a deploy.
 
 import argparse
 import json
-import requests
 import sys
+
+import requests
 
 
 def main():
@@ -34,7 +35,7 @@ def main():
                 "image": args.image,
                 "dockerCommand": args.docker_cmd,
             },
-        }
+        },
     }
 
     print("Patching Render service to set image ->", args.image)
@@ -53,7 +54,7 @@ def main():
     deploy_url = f"https://api.render.com/v1/services/{args.service}/deploys"
     print("Triggering deploy...")
     r2 = requests.post(
-        deploy_url, headers={"Authorization": f"Bearer {args.api_key}"}, timeout=30
+        deploy_url, headers={"Authorization": f"Bearer {args.api_key}"}, timeout=30,
     )
     print("deploy HTTP", r2.status_code)
     try:

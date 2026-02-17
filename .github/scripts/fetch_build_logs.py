@@ -7,9 +7,10 @@ Tries multiple endpoints to retrieve logs and falls back to events capture if lo
 """
 
 import argparse
-import requests
-import sys
 import json
+import sys
+
+import requests
 
 
 def main():
@@ -64,8 +65,7 @@ def main():
                     fh.write(r.text.encode("utf-8"))
             print("Saved logs to", args.out)
             return 0
-        else:
-            print("no logs at", url, "status", r.status_code)
+        print("no logs at", url, "status", r.status_code)
 
     print("Could not find build logs; saving events as fallback")
     with open(args.out, "w", encoding="utf-8") as fh:

@@ -7,8 +7,9 @@ Exits 0 on success, non-zero otherwise.
 """
 
 import argparse
-import requests
 import sys
+
+import requests
 
 
 def main():

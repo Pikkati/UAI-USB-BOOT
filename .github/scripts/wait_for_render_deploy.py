@@ -8,10 +8,11 @@ Prints deploy and build ids for downstream steps.
 """
 
 import argparse
-import time
-import requests
-import sys
 import json
+import sys
+import time
+
+import requests
 
 
 def get_latest_deploy(api_key, service_id):
