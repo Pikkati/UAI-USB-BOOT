@@ -1,13 +1,0 @@
-﻿Applied ruff --fix (safe) across repository on branch ix/ruff-fixes. This commit fixes a large set of formatting and lint issues. Remaining issues reported by ruff include many undefined names, syntax errors (merge conflict markers), and larger code problems that need manual fixes. I propose to split follow-up fixes into smaller PRs by subsystem.
-
-Notes:
-- 1279 fixes applied automatically.
-- 4376 ruff issues remain; many require manual/code changes beyond uff --fix.
-- I recommend reviewing key failure categories (undefined logger uses, syntactic merge conflict artifacts, duplicate keyword args 'timeout', bare excepts, and E402 import order issues).
-
-Next steps (if you approve):
-1. Triage remaining issues, create small PRs per subsystem (e.g., scripts, phases, uai-license-api).
-2. Fix merge conflict artifacts and syntax errors immediately (these block static analysis & tests).
-3. Add CI gating to run ruff on PRs and require pre-commit.
-
-This PR is large; opening as draft for review and iterative follow-up.

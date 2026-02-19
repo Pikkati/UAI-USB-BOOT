@@ -1,9 +1,0 @@
-# CODEOWNERS - default owner
-* @yushchyr
-
-# Path-specific owners
-/.github/workflows/ @yushchyr
-/scripts/ @yushchyr
-/docs/ @yushchyr
-/tests/ @yushchyr
-/docker*/ @yushchyr
