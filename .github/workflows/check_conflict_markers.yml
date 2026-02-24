@@ -1,0 +1,31 @@
+name: Check for merge conflict markers
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 5
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+  conflict-check:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Check for merge conflict markers
+        run: |
+          echo "Checking for merge conflict markers (<<<<<<<, =======, >>>>>>>)"
+          if git grep -n "<<<<<<<\|=======\|>>>>>>>" --quiet; then
+            echo "ERROR: Merge conflict markers found in the repository. Please resolve them before committing." >&2
+            git grep -n "<<<<<<<\|=======\|>>>>>>>"
+            exit 1
+          else
+            echo "No conflict markers found."
+          fi

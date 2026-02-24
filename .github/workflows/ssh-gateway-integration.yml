@@ -1,0 +1,168 @@
+﻿name: SSH Gateway Integration Test
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 20
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+  integration:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Create test network
+        run: |
+          docker network create ssh-net || true
+
+      - name: Build ssh-key-server image
+        run: |
+          docker build -t ssh-key-server:ci -f deploy/ssh-key-server/Dockerfile deploy/ssh-key-server
+
+      - name: Prepare test config (public key + token)
+        run: |
+          mkdir -p tmp_integration_config
+          ssh-keygen -t ed25519 -f /tmp/ci_test_ssh_key -N '' -q
+          pub=$(cat /tmp/ci_test_ssh_key.pub)
+          echo "$pub" > tmp_integration_config/ssh-key
+          printf '{"worker_token":"CI-SWMTKN-TEST","manager_ip":"127.0.0.1"}' > tmp_integration_config/swarm_join_tokens.json
+
+      - name: Run ssh-key-server
+        run: |
+          docker run -d --name ssh-key-server --network ssh-net -p 8888:8888 -v $PWD/tmp_integration_config:/app/config:ro ssh-key-server:ci
+
+      - name: Wait for ssh-key-server
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8888/ssh-key >/dev/null 2>&1; then echo ok; exit 0; fi
+            sleep 1
+          done
+          docker logs ssh-key-server || true
+          exit 1
+
+      - name: Build ssh-gateway image
+        run: |
+          docker build -t uai/ssh-gateway:ci ./docker/ssh-gateway
+
+      - name: Run ssh-gateway (connects to ssh-key-server)
+        run: |
+          docker run -d --name ssh-gateway --network ssh-net -e SSH_KEY_SERVER_URL="http://ssh-key-server:8888" -e SSH_GATEWAY_ROOT_PASSWORD="${{ secrets.SSH_GATEWAY_ROOT_PASSWORD }}" -p 2222:22 uai/ssh-gateway:ci
+
+      - name: Wait for ssh-gateway to fetch keys and start sshd
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ssh-gateway pgrep sshd >/dev/null 2>&1 && docker exec ssh-gateway test -f /root/.ssh/authorized_keys; then
+              echo "ssh-gateway ready"
+              docker exec ssh-gateway sh -c 'cat /root/.ssh/authorized_keys | head -n 1'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ssh-gateway did not become healthy; logs:" && docker logs ssh-gateway || true
+          exit 1
+
+      - name: Attempt SSH login (key-auth)
+        run: |
+          chmod 600 /tmp/ci_test_ssh_key
+          ssh -i /tmp/ci_test_ssh_key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost 'echo SUCCESS'
+
+      - name: Build fake-manager image
+        run: |
+          docker build -t fake-manager:ci deploy/test-images/fake-manager
+
+      - name: Run fake-manager (SSH manager simulation)
+        run: |
+          docker run -d --name fake-manager --network ssh-net -v $PWD/tmp_integration_config:/tmp/config:ro fake-manager:ci
+
+      - name: Wait for fake-manager SSH server
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec fake-manager pgrep sshd >/dev/null 2>&1 && docker exec fake-manager test -f /root/.ssh/authorized_keys; then
+              echo "fake-manager ssh ready"
+              docker exec fake-manager /usr/local/bin/docker swarm join-token worker -q
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "fake-manager did not become healthy; logs:" && docker logs fake-manager || true
+          exit 1
+
+      - name: Prepare worker shared dir (advertised nodes)
+        run: |
+          mkdir -p tmp_integration_shared
+          printf '{"node1": {"ip": "fake-manager", "timestamp": 1}}' > tmp_integration_shared/advertised_nodes.json
+
+      - name: Run swarm_autojoin CLI (end-to-end SSH fallback)
+        run: |
+          docker run --rm --network ssh-net -v $PWD:/workspace -w /workspace python:3.14-slim bash -lc "apt-get update && apt-get install -y openssh-client && python3 -m swarm_autojoin.swarm_worker_auto_join --shared-dir /workspace/tmp_integration_shared --debug | tee /tmp/swarm_autojoin.out && grep -q 'Dry-run join' /tmp/swarm_autojoin.out && grep -q 'CI-SWMTKN-SSH' /tmp/swarm_autojoin.out"
+
+      - name: Verify persisted swarm token file
+        run: |
+          echo "Checking for persisted token in tmp_integration_shared/swarm_tokens.json"
+          if [ ! -f tmp_integration_shared/swarm_tokens.json ]; then
+            echo "ERROR: swarm_tokens.json not found in tmp_integration_shared" && ls -la tmp_integration_shared || true && exit 1
+          fi
+          cat tmp_integration_shared/swarm_tokens.json
+          # Ensure the SSH-sourced token was persisted
+          grep -q 'CI-SWMTKN-SSH' tmp_integration_shared/swarm_tokens.json || (echo "ERROR: persisted token does not contain CI-SWMTKN-SSH" && exit 1)
+          # Validate JSON structure and manager_ip
+          python3 - <<'PY'
+          import json,sys
+          try:
+              d=json.load(open('tmp_integration_shared/swarm_tokens.json'))
+          except Exception as e:
+              print('ERROR: invalid JSON in swarm_tokens.json', e); sys.exit(1)
+          if d.get('worker_token')!='CI-SWMTKN-SSH':
+              print('ERROR: unexpected worker_token', d.get('worker_token')); sys.exit(1)
+          if d.get('manager_ip')!='fake-manager':
+              print('ERROR: unexpected manager_ip', d.get('manager_ip')); sys.exit(1)
+          print('persisted token JSON ok')
+          PY
+
+      - name: Compare persisted manager_ip with advertised nodes
+        run: |
+          echo "Comparing manager_ip in persisted token with advertised nodes"
+          if [ ! -f tmp_integration_shared/advertised_nodes.json ]; then
+            echo "ERROR: advertised_nodes.json missing" && ls -la tmp_integration_shared || true && exit 1
+          fi
+          python3 - <<'PY'
+          import json,sys
+          adv=json.load(open('tmp_integration_shared/advertised_nodes.json'))
+          tok=json.load(open('tmp_integration_shared/swarm_tokens.json'))
+          man=tok.get('manager_ip')
+          if not any(info.get('ip')==man for info in adv.values()):
+              print('ERROR: persisted manager_ip',man,'not found in advertised nodes',adv); sys.exit(1)
+          print('advertised node matches persisted manager_ip')
+          PY
+
+      - name: Verify worker-token via HTTP
+        run: |
+          curl -fsS http://localhost:8888/worker-token | grep -q CI-SWMTKN-TEST
+
+    # Cleanup
+    cleanup:
+      needs: [integration, credit_check]
+      runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+      if: always()
+      steps:
+        - name: Cleanup containers
+          run: |
+            docker rm -f ssh-gateway ssh-key-server fake-manager || true
+            docker network rm ssh-net || true
+            rm -rf tmp_integration_config tmp_integration_shared /tmp/ci_test_ssh_key* || true

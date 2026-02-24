@@ -1,0 +1,63 @@
+name: Report root-owned pre-check results to Issue #367
+
+on:
+  workflow_run:
+    workflows:
+      - 'Root-owned files pre-check'
+    types: [completed]
+
+permissions:
+  issues: write
+  actions: write
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post results to Issue #367
+        uses: actions/github-script@00f12e3e20659f42342b1c0226afda7f7c042325
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const run = context.payload.workflow_run;
+            const conclusion = run.conclusion;
+            const html_url = run.html_url;
+            const issue_number = 367;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let body = `Pre-check workflow completed with conclusion: **${conclusion}**.\n\nRun details: ${html_url}\n\n`;
+            if (conclusion === 'failure') {
+              body += "Root-owned files were detected. Diagnostic artifacts are available on the run page. Please confirm remediation and comment `/runner-fixed` in this issue when ready to re-run the pre-check.";
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            } else {
+              // Pre-check passed: attempt to re-run failed workflow runs for the same commit
+              body += "No root-owned files detected. Attempting to re-run failed CI jobs for this commit.";
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+              const head_sha = run.head_sha;
+              if (!head_sha) {
+                await github.rest.issues.createComment({owner, repo, issue_number, body: `Cannot determine head SHA for this run; please specify which workflow to rerun.`});
+              } else {
+                // List workflow runs for this head SHA
+                const res = await github.rest.actions.listWorkflowRunsForRepo({owner, repo, head_sha, per_page: 100});
+                const runs = res.data.workflow_runs || [];
+                // Filter to failed runs (exclude this pre-check run and the pre-check workflow)
+                const failedRuns = runs.filter(r => r.conclusion === 'failure' && r.id !== run.id && r.name !== 'Root-owned files pre-check');
+                if (failedRuns.length === 0) {
+                  await github.rest.issues.createComment({owner, repo, issue_number, body: `Pre-check passed but found no failed workflow runs to re-run for commit ${head_sha}.`});
+                } else {
+                  let rerunCount = 0;
+                  let rerunList = [];
+                  for (const fr of failedRuns) {
+                    try {
+                      await github.rest.actions.reRunWorkflow({owner, repo, run_id: fr.id});
+                      rerunCount++;
+                      rerunList.push(`${fr.name} — ${fr.html_url}`);
+                    } catch (err) {
+                      await github.rest.issues.createComment({owner, repo, issue_number, body: `Failed to request re-run for ${fr.name} (run ${fr.id}): ${err.message}`});
+                    }
+                  }
+                  await github.rest.issues.createComment({owner, repo, issue_number, body: `Requested re-run for ${rerunCount} failed workflow runs on commit ${head_sha}:\n\n${rerunList.join('\n')}`});
+                }
+              }
+            }

@@ -1,0 +1,104 @@
+﻿name: Sync Key Vault → GitHub Secrets
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type CONFIRM to actually sync secrets'
+        required: true
+        default: 'DECLINE'
+
+permissions:
+  contents: read
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 2
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  sync:
+    name: Sync Key Vault secrets to GitHub
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.confirm == 'CONFIRM' }}
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Azure Login (Service Principal)
+        uses: azure/login@cb79c773a3cfa27f31f25eb3f677781210c9ce3d
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Ensure gh is available
+        run: gh --version || (echo "gh not available" && exit 1)
+
+      - name: Fetch REPO_SECRETS_PAT from Key Vault (if not set as repo secret)
+        id: fetch_pat
+        run: |
+          set -euo pipefail
+          echo "Fetching REPO-SECRETS-PAT from Key Vault if available..."
+          secret=$(az keyvault secret show --vault-name "${{ secrets.AZURE_KEY_VAULT_NAME }}" --name "REPO-SECRETS-PAT" --query value -o tsv 2>/dev/null || true)
+          if [ -n "$secret" ]; then
+            echo "REPO_SECRETS_PAT=$secret" >> $GITHUB_ENV
+            echo "Loaded REPO_SECRETS_PAT from Key Vault (masked): ${secret:0:4}...${secret: -4}"
+          else
+            echo "No REPO-SECRETS-PAT found in Key Vault; ensure REPO_SECRETS_PAT repo secret or add REPO-SECRETS-PAT to Key Vault."
+          fi
+
+      - name: Sync Key Vault secrets to GitHub (dry-run if REPO_SECRETS_PAT missing)
+        env:
+          VAULT_NAME: uai-copilot-kv
+          REPO: ${{ github.repository }}
+          PAT: ${{ env.REPO_SECRETS_PAT }}
+        run: |
+          set -euo pipefail
+
+          declare -A MAP=(
+            ["OPENAI-API-KEY"]="OPENAI_API_KEY"
+            ["PINECONE-API-KEY"]="PINECONE_API_KEY"
+            ["AWS-ACCESS-KEY-ID"]="AWS_ACCESS_KEY_ID"
+            ["AWS-SECRET-ACCESS-KEY"]="AWS_SECRET_ACCESS_KEY"
+            ["VERCEL-TOKEN"]="VERCEL_TOKEN"
+            ["VSCE-PAT"]="VSCE_PAT"
+            ["OVSX-TOKEN"]="OVSX_TOKEN"
+            ["PUBLISHER-ID"]="PUBLISHER_ID"
+            ["UAI-MARKETPLACE-PAT"]="UAI_MARKETPLACE_PAT"
+            # Provider tokens
+            ["CLOUDFLARE-API-TOKEN"]="CLOUDFLARE_API_TOKEN"
+            ["NETLIFY-TOKEN"]="NETLIFY_TOKEN"
+            ["NETLIFY-SITE-ID"]="NETLIFY_SITE_ID"
+            ["SUPABASE-ACCESS-TOKEN"]="SUPABASE_ACCESS_TOKEN"
+            ["MONGODB-URI"]="MONGODB_URI"
+            ["RAILWAY-TOKEN"]="RAILWAY_TOKEN"
+            ["KOYEB-API-KEY"]="KOYEB_API_KEY"
+            ["RENDER-API-KEY"]="RENDER_API_KEY"
+          )
+
+          if [[ -z "${PAT:-}" ]]; then
+            echo "⚠️  REPO_SECRETS_PAT not configured — running in dry-run mode. Add REPO_SECRETS_PAT to enable writing GitHub secrets."
+          fi
+
+          for kv in "${!MAP[@]}"; do
+            gh_name=${MAP[$kv]}
+            echo "Checking Key Vault secret: $kv"
+            secret_val=$(az keyvault secret show --vault-name "$VAULT_NAME" --name "$kv" --query value -o tsv 2>/dev/null || true)
+            if [[ -z "$secret_val" ]]; then
+              echo "  - Missing in Key Vault: $kv"
+              continue
+            fi
+            # mask the value in workflow logs
+            echo "::add-mask::$secret_val"
+            if [[ -z "${PAT:-}" ]]; then
+              echo "  - (Dry-run) Would set GitHub secret: $gh_name"
+            else
+              echo "  - Setting GitHub secret: $gh_name"
+              # Authenticate gh with token and set the secret
+              printf '%s' "$PAT" | gh auth login --with-token
+              gh secret set "$gh_name" --body "$secret_val" --repo "$REPO"
+            fi
+          done

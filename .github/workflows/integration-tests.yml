@@ -1,0 +1,76 @@
+﻿name: Integration Tests (Extension)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 20
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  integration:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    env:
+      SKIP_TESTS_AWS: 'true'
+      SKIP_TESTS_AZURE: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./vscode-extension
+
+      - name: Build extension bundle
+        run: npm run bundle
+        working-directory: ./vscode-extension
+
+      - name: Compile tests
+        run: npm run test:compile
+        working-directory: ./vscode-extension
+
+      - name: Install Xvfb and dependencies (robust)
+        run: |
+          sudo apt-get update
+          # Install minimal display dependencies; some package names changed on newer Ubuntu releases.
+          sudo apt-get install -y --no-install-recommends xvfb libgtk-3-0 libxss1 libnss3 libgbm1 || true
+          # Fallback: on Ubuntu 24.04 audio packages may have different names
+          sudo apt-get install -y libasound2t64 || true
+          # Verify Xvfb is installed; warn but continue to allow diagnostics to run in CI
+          if ! command -v Xvfb >/dev/null 2>&1; then
+            echo 'Warning: Xvfb not available; integration tests may fail, but continuing to collect diagnostics.'
+          fi
+        working-directory: ./vscode-extension
+
+      - name: Run integration tests (headless X)
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24 -ac' npm run test:integration
+        working-directory: ./vscode-extension
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5
+        with:
+          name: integration-test-logs
+          path: vscode-extension/.vscode-test || ''
+
+      - name: Notify Slack on failure
+        if: ${{ failure() }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "No SLACK_WEBHOOK_URL configured; skipping slack notification"; exit 0; fi
+          PAYLOAD="{\"text\":\"[UAI] Integration tests failed in ${GITHUB_REPOSITORY} (<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|run ${GITHUB_RUN_ID}>)\"}"
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" || true

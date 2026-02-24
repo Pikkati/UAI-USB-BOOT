@@ -1,0 +1,20 @@
+name: Self-hosted Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, monitoring]
+    timeout-minutes: 10
+    steps:
+      - name: Smoke test - print environment
+        run: |
+          echo "Hello from self-hosted runner"
+          echo "Runner: $(hostname)"
+          uname -a
+          id
+          df -h
+          echo "--- env ---"
+          env | sort
+          echo "--- done ---"

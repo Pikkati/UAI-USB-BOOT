@@ -1,0 +1,52 @@
+name: Swarm Autojoin CI
+
+on: [push, pull_request]
+
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 5
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+  test:
+    needs: [credit_check]
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    container:
+      image: python:3.10-slim
+
+    steps:
+      - name: Prepare container
+        run: |
+          apt-get update
+          apt-get install -y git build-essential
+
+      - name: Checkout (manual)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          git init .
+          # Git may refuse to operate inside directories it deems to have dubious ownership
+          # (git >=2.35). When running inside a container the workspace directory ownership
+          # can differ from the runner user. Mark the workspace as safe so manual checkout
+          # commands succeed under the container environment.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin ${{ github.sha }} || git fetch --depth=1 origin +refs/heads/*:refs/remotes/origin/*
+          git checkout -f ${{ github.sha }} || git checkout -f FETCH_HEAD || true
+
+      - name: Install deps
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python -m pip install --upgrade pip
+          python -m pip install -r ./requirements-dev.txt
+          python -m pip install -r ./swarm_autojoin/requirements.txt
+          python -m pip install pytest pytest-cov pytest-benchmark pytest-timeout
+
+      - name: Run tests
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          pytest -q

@@ -1,0 +1,94 @@
+﻿name: Auto-merge monitor PRs
+true:
+  pull_request:
+    types:
+    - opened
+    - labeled
+    - synchronize
+    - reopened
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+  statuses: read
+jobs:
+  credit_check:
+    uses: ./.github/workflows/actions-credit-guard-enhanced.yml
+    with:
+      estimated_minutes: 10
+      threshold_percent: 3
+      force_local: true
+      fallback_runner: '["self-hosted","docker-swarm"]'
+      slack_webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  auto-merge:
+    runs-on: ${{ fromJson(needs.credit_check.outputs.runner) }}
+    steps:
+    - name: Check PR is a monitor automation PR
+      id: check_pr
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: "const pr = context.payload.pull_request;\nif (!pr) return 'false';\n\
+          const branch = pr.head.ref || '';\nconst labels = (pr.labels || []).map(l\
+          \ => l.name.toLowerCase());\nconst title = (pr.title || '').toLowerCase();\n\
+          const author = pr.user && pr.user.login;\n\nconst branch_ok = branch ===\
+          \ 'automated/remove-ecdsa-ignore' || branch.startsWith('automated/');\n\
+          const label_ok = labels.includes('automated') || labels.includes('security');\n\
+          const author_ok = ['github-actions[bot]', 'github-actions'].includes(author);\n\
+          const title_ok = title.includes('remove temporary ecdsa cve ignore') ||\
+          \ title.includes('remove temporary ecdsa');\n\nif (branch_ok || label_ok\
+          \ || author_ok || title_ok) {\n  return 'true';\n}\nreturn 'false';\n"
+    - name: Wait for checks to complete and succeed
+      id: wait_checks
+      if: steps.check_pr.outputs.result == 'true'
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: "const pr = context.payload.pull_request;\nconst owner = context.repo.owner;\n\
+          const repo = context.repo.repo;\nconst ref = pr.head.sha;\n\nconst maxAttempts\
+          \ = 60; // ~30 minutes (60 * 30s)\nconst delayMs = 30000;\n\nfor (let i\
+          \ = 0; i < maxAttempts; i++) {\n  const { data: checksData } = await github.rest.checks.listForRef({\
+          \ owner, repo, ref });\n  const checkRuns = checksData.check_runs || [];\n\
+          \n  if (checkRuns.length === 0) {\n    console.log('No check runs yet; waiting...');\n\
+          \  } else {\n    const allCompleted = checkRuns.every(c => c.status ===\
+          \ 'completed');\n    const allGood = checkRuns.every(c => c.status === 'completed'\
+          \ && (c.conclusion === 'success' || c.conclusion === 'neutral' || c.conclusion\
+          \ === 'skipped'));\n    const anyFailed = checkRuns.some(c => c.status ===\
+          \ 'completed' && (c.conclusion === 'failure' || c.conclusion === 'cancelled'\
+          \ || c.conclusion === 'timed_out'));\n\n    if (anyFailed) {\n      console.log('A\
+          \ check run failed; aborting auto-merge.');\n      return 'failed';\n  \
+          \  }\n\n    if (allCompleted && allGood) {\n      console.log('All checks\
+          \ completed and successful.');\n      return 'ready';\n    }\n\n    console.log(`Checks\
+          \ not ready (attempt ${i + 1}/${maxAttempts}).`);\n  }\n\n  await new Promise(r\
+          \ => setTimeout(r, delayMs));\n}\n\nconsole.log('Timed out waiting for checks.');\n\
+          return 'timeout';\n"
+    - name: Auto-merge PR when ready
+      if: steps.check_pr.outputs.result == 'true' && steps.wait_checks.outputs.result
+        == 'ready'
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: "const owner = context.repo.owner;\nconst repo = context.repo.repo;\n\
+          const prNum = context.payload.pull_request && context.payload.pull_request.number;\n\
+          if (!prNum) throw new Error('No pull_request found in context; cannot auto-merge.');\n\
+          const pr = (await github.rest.pulls.get({ owner, repo, pull_number: prNum\
+          \ })).data;\n\n// Fail if mergeable state is dirty to avoid merging in an\
+          \ inconsistent state\nif (pr.mergeable_state === 'dirty') {\n  throw new\
+          \ Error(`Mergeable state is 'dirty' for PR #${prNum}; aborting auto-merge.`);\n\
+          }\n\n// Attempt merge\nconst mergeResponse = await github.rest.pulls.merge({\n\
+          \  owner,\n  repo,\n  pull_number: prNum,\n  merge_method: 'merge',\n  commit_title:\
+          \ \"chore(security): auto-merge ecdsa ignore removal\"\n});\nconsole.log('Merge\
+          \ result:', mergeResponse.data);\n\n// Delete head branch if it's in the\
+          \ same repository\nif (pr.head && pr.head.repo && pr.head.repo.full_name\
+          \ === `${owner}/${repo}`) {\n  try {\n    await github.rest.git.deleteRef({\
+          \ owner, repo, ref: `heads/${pr.head.ref}` });\n    console.log(`Deleted\
+          \ branch: ${pr.head.ref}`);\n  } catch (e) {\n    console.warn(`Failed to\
+          \ delete branch ${pr.head.ref}: ${e.message}`);\n  }\n} else {\n  console.log('Head\
+          \ branch is from a fork or different repo; skipping branch deletion.');\n\
+          }\n"
+    - name: Skip auto-merge (not applicable or checks not ready)
+      if: steps.check_pr.outputs.result != 'true' || steps.wait_checks.outputs.result
+        != 'ready'
+      run: 'echo "Auto-merge not performed: check_pr=${{ steps.check_pr.outputs.result
+        }}, wait_checks=${{ steps.wait_checks.outputs.result }}"
+
+        '
+    needs:
+    - credit_check

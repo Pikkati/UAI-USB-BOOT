@@ -1,0 +1,328 @@
+﻿name: Pre-Trigger Health Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_workflow:
+        description: 'Workflow to check before triggering'
+        required: true
+        type: string
+      check_type:
+        description: 'Type of health check to perform'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - quick
+          - full
+          - billing_only
+  repository_dispatch:
+    types: [pre-trigger-check]
+
+jobs:
+  health_verification:
+    runs-on: [self-hosted, docker-swarm]
+    outputs:
+      can_proceed: ${{ steps.health.outputs.can_proceed }}
+      issues_found: ${{ steps.health.outputs.issues_found }}
+      recommendations: ${{ steps.health.outputs.recommendations }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Perform Health Verification
+        id: health
+        run: |
+          set -euo pipefail
+          echo "🏥 Performing pre-trigger health verification..."
+
+          TARGET_WORKFLOW="${{ github.event.inputs.target_workflow }}"
+          CHECK_TYPE="${{ github.event.inputs.check_type }}"
+          CAN_PROCEED="true"
+          ISSUES_FOUND=""
+          RECOMMENDATIONS=""
+          CURRENT_USAGE="0"
+          REMAINING_MINUTES="30000"
+          INCLUDED_MINUTES="30000"
+          USED_MINUTES="0"
+
+          # Get billing info - prefer ORG_BILLING_TOKEN
+          if [ -n "${{ secrets.ORG_BILLING_TOKEN }}" ]; then
+            echo "🔐 Using ORG_BILLING_TOKEN to query billing"
+            TOKEN="${{ secrets.ORG_BILLING_TOKEN }}"
+            BILLING_RESP=$(curl -sS -H "Authorization: token $TOKEN" "https://api.github.com/orgs/${{ github.repository_owner }}/settings/billing/actions" || true)
+            INCLUDED_MINUTES=$(echo "$BILLING_RESP" | jq -r '.included_minutes // empty' || echo "")
+            USED_MINUTES=$(echo "$BILLING_RESP" | jq -r '.total_minutes_used // empty' || echo "")
+            if [ -n "$INCLUDED_MINUTES" ] && [ -n "$USED_MINUTES" ]; then
+              REMAINING_MINUTES=$((INCLUDED_MINUTES - USED_MINUTES))
+            else
+              echo "⚠️ Billing API returned unexpected response; falling back to defaults"
+              INCLUDED_MINUTES="30000"
+              USED_MINUTES="0"
+              REMAINING_MINUTES="30000"
+            fi
+          else
+            echo "ℹ️ ORG_BILLING_TOKEN not set; attempting to use GITHUB_TOKEN"
+            # Flag missing ORG_BILLING_TOKEN so maintainers add it for accurate billing queries
+            ISSUES_FOUND="${ISSUES_FOUND}ORG_BILLING_TOKEN not found; billing queries may be incomplete. "
+            RECOMMENDATIONS="${RECOMMENDATIONS}Create a repository secret 'ORG_BILLING_TOKEN' containing a PAT with billing read permissions. "
+
+            BILLING_RESP=$(curl -sS -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/orgs/${{ github.repository_owner }}/settings/billing/actions" || true)
+            INCLUDED_MINUTES=$(echo "$BILLING_RESP" | jq -r '.included_minutes // empty' || echo "")
+            USED_MINUTES=$(echo "$BILLING_RESP" | jq -r '.total_minutes_used // empty' || echo "")
+            if [ -n "$INCLUDED_MINUTES" ] && [ -n "$USED_MINUTES" ]; then
+              REMAINING_MINUTES=$((INCLUDED_MINUTES - USED_MINUTES))
+            else
+              # Try repo-level usage as a last resort
+              REPO_USAGE=$(curl -sS -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/actions/usage" || true)
+              USED_MINUTES=$(echo "$REPO_USAGE" | jq '[.billable?.UBUNTU?.total_minutes, .billable?.MACOS?.total_minutes, .billable?.WINDOWS?.total_minutes] | map(. // 0) | add' || echo "0")
+              if [ -n "$USED_MINUTES" ]; then
+                INCLUDED_MINUTES="30000"
+                REMAINING_MINUTES=$((INCLUDED_MINUTES - USED_MINUTES))
+                echo "ℹ️ Using repo-level usage as fallback (used=${USED_MINUTES})"
+              else
+                echo "⚠️ Unable to determine billing usage; using defaults"
+                INCLUDED_MINUTES="30000"
+                USED_MINUTES="0"
+                REMAINING_MINUTES="30000"
+              fi
+            fi
+          fi
+
+          # Compute current usage percentage
+          if [ -n "$INCLUDED_MINUTES" ] && [ "$INCLUDED_MINUTES" -gt 0 ]; then
+            CURRENT_USAGE=$(echo "scale=2; ($USED_MINUTES / $INCLUDED_MINUTES) * 100" | bc -l 2>/dev/null || echo "0")
+          else
+            CURRENT_USAGE="0"
+          fi
+
+          # Check for critical usage thresholds
+          if (( $(echo "$CURRENT_USAGE > 95" | bc -l) )); then
+            CAN_PROCEED="false"
+            ISSUES_FOUND="${ISSUES_FOUND}Critical usage threshold exceeded (${CURRENT_USAGE}%). "
+            RECOMMENDATIONS="${RECOMMENDATIONS}Wait for usage reset or upgrade plan. "
+          fi
+
+          if [ "$REMAINING_MINUTES" -lt 100 ]; then
+            CAN_PROCEED="false"
+            ISSUES_FOUND="${ISSUES_FOUND}Low remaining minutes (${REMAINING_MINUTES}). "
+            RECOMMENDATIONS="${RECOMMENDATIONS}Monitor usage closely. "
+          fi
+
+          # Check workflow-specific recent failures if full check
+          if [ "$CHECK_TYPE" = "full" ]; then
+            echo "🔍 Checking recent workflow history..."
+            RECENT_RUNS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=5")
+
+            FAILURE_COUNT=$(echo "$RECENT_RUNS" | jq '[.workflow_runs[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo "0")
+            if [ "$FAILURE_COUNT" -gt 2 ]; then
+              ISSUES_FOUND="${ISSUES_FOUND}Multiple recent failures detected (${FAILURE_COUNT}/5). "
+              RECOMMENDATIONS="${RECOMMENDATIONS}Investigate recent workflow failures before proceeding. "
+            fi
+          fi
+
+          # Check for online self-hosted runners with docker-swarm label
+          echo "🐝 Checking self-hosted runner pool for 'docker-swarm' online runners..."
+          RUNNERS_JSON=$(curl -sS -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/actions/runners" || true)
+          ONLINE_SWARM_COUNT=$(echo "$RUNNERS_JSON" | jq '[.runners[] | select(.status == "online" and (any(.labels[]?; .name == "docker-swarm")))] | length' 2>/dev/null || echo "0")
+          if [ "$ONLINE_SWARM_COUNT" -lt 1 ]; then
+            CAN_PROCEED="false"
+            ISSUES_FOUND="${ISSUES_FOUND}No online self-hosted runners labeled 'docker-swarm'. "
+            RECOMMENDATIONS="${RECOMMENDATIONS}Ensure at least one self-hosted runner with 'docker-swarm' label is online. "
+          fi
+
+          # Final decision message
+          if [ "$CAN_PROCEED" = "false" ]; then
+            echo "❌ Pre-trigger check FAILED - workflow should not proceed"
+          else
+            echo "✅ Pre-trigger check PASSED - workflow can proceed"
+          fi
+
+          echo "can_proceed=$CAN_PROCEED" >> $GITHUB_OUTPUT
+          echo "issues_found=$ISSUES_FOUND" >> $GITHUB_OUTPUT
+          echo "recommendations=$RECOMMENDATIONS" >> $GITHUB_OUTPUT
+          echo "current_usage=$CURRENT_USAGE" >> $GITHUB_OUTPUT
+          echo "remaining_minutes=$REMAINING_MINUTES" >> $GITHUB_OUTPUT
+
+  send_notification:
+    needs: health_verification
+    if: always()
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Send Pre-Trigger Notification
+        run: |
+          CAN_PROCEED="${{ needs.health_verification.outputs.can_proceed }}"
+          ISSUES="${{ needs.health_verification.outputs.issues_found }}"
+          RECOMMENDATIONS="${{ needs.health_verification.outputs.recommendations }}"
+          TARGET_WORKFLOW="${{ github.event.inputs.target_workflow }}"
+
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            if [ "$CAN_PROCEED" = "true" ]; then
+              COLOR="good"
+              TITLE="✅ Pre-Trigger Check Passed"
+              TEXT="Workflow '${TARGET_WORKFLOW}' is ready to proceed."
+            else
+              COLOR="danger"
+              TITLE="❌ Pre-Trigger Check Failed"
+              TEXT="Workflow '${TARGET_WORKFLOW}' should NOT proceed.\\n\\nIssues: ${ISSUES}\\n\\nRecommendations: ${RECOMMENDATIONS}"
+            fi
+
+            PAYLOAD=$(cat <<EOF
+            {
+              "attachments": [
+                {
+                  "color": "$COLOR",
+                  "title": "$TITLE",
+                  "text": "$TEXT",
+                  "fields": [
+                    {
+                      "title": "Target Workflow",
+                      "value": "$TARGET_WORKFLOW",
+                      "short": true
+                    },
+                    {
+                      "title": "Check Type",
+                      "value": "${{ github.event.inputs.check_type }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Usage",
+                      "value": "${{ needs.health_verification.outputs.current_usage }}%",
+                      "short": true
+                    },
+                    {
+                      "title": "Remaining Minutes",
+                      "value": "${{ needs.health_verification.outputs.remaining_minutes }}",
+                      "short": true
+                    }
+                  ],
+                  "footer": "Pre-Trigger Health Check",
+                  "ts": $(date +%s)
+                }
+              ]
+            }
+          EOF
+          )
+
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Pre-trigger notification failed"
+          fi
+
+  create_issue_on_failure:
+    needs: health_verification
+    if: needs.health_verification.outputs.can_proceed == 'false'
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Create GitHub Issue for Pre-Trigger Failure
+        run: |
+          ISSUES="${{ needs.health_verification.outputs.issues_found }}"
+          RECOMMENDATIONS="${{ needs.health_verification.outputs.recommendations }}"
+          TARGET_WORKFLOW="${{ github.event.inputs.target_workflow }}"
+
+          ISSUE_TITLE="🚨 Pre-Trigger Check Failed for ${TARGET_WORKFLOW}"
+          ISSUE_BODY=$(cat <<EOF
+          ## Pre-Trigger Health Check Failed
+
+          **Target Workflow:** ${TARGET_WORKFLOW}
+          **Check Time:** $(date -Iseconds)
+          **Check Type:** ${{ github.event.inputs.check_type }}
+
+          ### Issues Found
+          ${ISSUES}
+
+          ### Recommendations
+          ${RECOMMENDATIONS}
+
+          ### Current Status
+          - Usage: ${{ needs.health_verification.outputs.current_usage }}%
+          - Remaining Minutes: ${{ needs.health_verification.outputs.remaining_minutes }}
+
+          ### Actions Required
+          - [ ] Review and resolve identified issues
+          - [ ] Re-run pre-trigger check
+          - [ ] Proceed with workflow only after issues are resolved
+
+          ---
+          *This issue was automatically created by the pre-trigger health check system.*
+          EOF
+          )
+
+          # Create GitHub issue
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues \
+            -d "{\"title\":\"$ISSUE_TITLE\",\"body\":\"$ISSUE_BODY\",\"labels\":[\"pre-trigger-failure\",\"automation\"]}" || \
+            echo "Failed to create GitHub issue"
+
+  generate_report:
+    needs: health_verification
+    if: always()
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Generate Pre-Trigger Report
+        run: |
+          mkdir -p pre-trigger-reports
+
+          cat > pre-trigger-reports/check-$(date +%Y-%m-%d_%H-%M-%S).json << EOF
+          {
+            "timestamp": "$(date -Iseconds)",
+            "target_workflow": "${{ github.event.inputs.target_workflow }}",
+            "check_type": "${{ github.event.inputs.check_type }}",
+            "can_proceed": ${{ needs.health_verification.outputs.can_proceed }},
+            "issues_found": "${{ needs.health_verification.outputs.issues_found }}",
+            "recommendations": "${{ needs.health_verification.outputs.recommendations }}",
+            "current_usage_percentage": ${{ needs.health_verification.outputs.current_usage }},
+            "remaining_minutes": ${{ needs.health_verification.outputs.remaining_minutes }},
+            "workflow_run": "${{ github.run_id }}",
+            "trigger": "${{ github.event_name }}"
+          }
+          EOF
+
+          echo "📋 Pre-trigger check report generated:"
+          cat pre-trigger-reports/check-*.json
+
+      - name: Commit Pre-Trigger Reports
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          if git diff --quiet pre-trigger-reports/; then
+            echo "No reports to commit"
+          else
+            git add pre-trigger-reports/
+            git commit -m "📋 Pre-trigger check report - ${{ github.event.inputs.target_workflow }} - $(date)" || true
+            git push origin HEAD:pre-trigger-reports 2>/dev/null || \
+              (git checkout -b pre-trigger-reports && git push -u origin pre-trigger-reports)
+          fi
+
+      - name: Generate Summary Report
+        run: |
+          CAN_PROCEED="${{ needs.health_verification.outputs.can_proceed }}"
+          TARGET_WORKFLOW="${{ github.event.inputs.target_workflow }}"
+
+          echo "## 🏥 Pre-Trigger Health Check Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow | Can Proceed | Issues | Recommendations |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------------|--------|----------------|" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$CAN_PROCEED" = "true" ]; then
+            STATUS="✅ Yes"
+          else
+            STATUS="❌ No"
+          fi
+
+          echo "| $TARGET_WORKFLOW | $STATUS | ${{ needs.health_verification.outputs.issues_found }} | ${{ needs.health_verification.outputs.recommendations }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Current Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- Usage: ${{ needs.health_verification.outputs.current_usage }}%" >> $GITHUB_STEP_SUMMARY
+          echo "- Remaining Minutes: ${{ needs.health_verification.outputs.remaining_minutes }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Pre-trigger health checks help prevent workflow failures and optimize resource usage.*" >> $GITHUB_STEP_SUMMARY
+          echo "*Check completed: $(date)*" >> $GITHUB_STEP_SUMMARY

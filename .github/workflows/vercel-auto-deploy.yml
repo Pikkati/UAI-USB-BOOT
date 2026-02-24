@@ -1,0 +1,49 @@
+﻿name: Auto Deploy to Vercel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Verify Vercel token & project access
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          echo "Verifying Vercel token and project access..."
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::VERCEL_TOKEN is not set. Please create a Vercel token for a user that has access to the target team/project and save it as VERCEL_TOKEN in repo secrets."
+            exit 1
+          fi
+          sudo apt-get update -y && sudo apt-get install -y curl
+          npm install -g vercel@latest
+          out=$(vercel whoami --token=$VERCEL_TOKEN 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -qi "not logged in\|Not authenticated\|Unauthorized"; then
+            echo "::error::VERCEL_TOKEN is invalid or cannot authenticate. Create a user token and save it as VERCEL_TOKEN."
+            exit 1
+          fi
+          proj_out=$(vercel projects inspect $VERCEL_PROJECT_ID --token=$VERCEL_TOKEN 2>&1 || true)
+          echo "$proj_out"
+          if echo "$proj_out" | grep -qi "not found\|You do not have permission"; then
+            echo "::error::Vercel token user does not have access to the project or project not found. Make sure the token belongs to a user with access to the target Vercel team/project and the secrets VERCEL_PROJECT_ID/VERCEL_ORG_ID are correct."
+            exit 1
+          fi
+
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@2d78157ee070f28ff89dd4da74e0369fc26d3b34
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

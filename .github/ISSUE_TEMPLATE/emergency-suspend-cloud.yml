@@ -1,0 +1,64 @@
+name: Emergency — Suspend Cloud & CI Usage
+description: Creates an emergency issue to instruct all contributors and automation to stop using Azure, AWS, and GitHub Actions until investigation completes.
+title: "[EMERGENCY] Suspend Azure/AWS/GitHub Actions — DO NOT RUN"
+labels: ["emergency","security","investigation","blocked"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **EMERGENCY: Suspend all Azure, AWS and GitHub Actions usage — DO NOT RUN** 🚫
+
+        We discovered potentially unauthorized or high-cost activity. Until the Security & Finance teams confirm it's safe, **DO NOT** run any deployment, cloud CLI commands (`az`, `aws`, `gcloud`) or GitHub Actions workflows.
+
+  - type: input
+    id: incident-owner
+    attributes:
+      label: "Incident owner (name / email)"
+      description: "Who will coordinate the pause and investigation"
+      placeholder: "e.g., security@uai-copilot.com"
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Summary of why this pause is requested"
+      description: "Attach invoice ID, portal screenshot, or a short explanation."
+      placeholder: "e.g., Subscription disabled; unexpected invoice CA$1,342, noticed 2026-01-19"
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: "Severity"
+      description: "Select the incident severity"
+      options:
+        - "critical"
+        - "high"
+        - "medium"
+        - "low"
+
+  - type: markdown
+    attributes:
+      value: |
+        **Immediate checklist (mark done as you complete each step)**
+        - [ ] Disable all scheduled GitHub workflows (UI or `gh workflow disable`) and stop self-hosted runners where possible.
+        - [ ] Set repo Actions permissions to **disabled** or restrict to repository admins (Settings → Actions).
+        - [ ] Remove / rotate cloud credentials in GitHub Secrets: `AZURE_CREDENTIALS`, `AWS_*`, `GCP_*`, etc. (use `gh secret remove` or the UI).
+        - [ ] Pause/scale-to-zero or stop cloud resources if you have the appropriate permissions: Redis, VMs, AKS nodepools, ACI instances, Public IPs, Load Balancers.
+        - [ ] Collect evidence (activity logs, sign-ins, role assignments, usage) and attach outputs. See `SECURITY/azure_subscription_disabled_support_request.md` and `scripts/security/collect_azure_evidence.ps1`.
+        - [ ] Add labels: `emergency`, `security`, `investigation`; @mention Finance and Security teams.
+        - [ ] Do NOT delete resources unless explicitly authorized by Security.
+
+  - type: input
+    id: who_will_act
+    attributes:
+      label: "Who will execute the checklist?"
+      description: "List person(s)/team(s) responsible for the pause and investigation"
+      placeholder: "e.g., alice@..., security-team"
+
+  - type: textarea
+    id: exceptions
+    attributes:
+      label: "Exceptions / Notes"
+      description: "If any workflow must run for investigation, list justification and explicit approver"
+      placeholder: "e.g., Only approved person X may run workflow Y for evidence collection."

@@ -1,0 +1,122 @@
+﻿name: Track GitHub Actions Usage
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Hourly
+  workflow_dispatch:
+
+jobs:
+  track:
+    runs-on: [self-hosted, docker-swarm]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Get Billing Info
+        id: billing
+        run: |
+          set -euo pipefail
+
+          # Prefer explicit ORG_BILLING_TOKEN (personal token with billing read permissions)
+          if [ -n "${{ secrets.ORG_BILLING_TOKEN }}" ]; then
+            TOKEN="${{ secrets.ORG_BILLING_TOKEN }}"
+            echo "Using ORG_BILLING_TOKEN for billing API"
+            resp=$(curl -sS -H "Authorization: token $TOKEN" "https://api.github.com/orgs/${{ github.repository_owner }}/settings/billing/actions" || true)
+            included=$(echo "$resp" | jq -r '.included_minutes // empty') || true
+            used=$(echo "$resp" | jq -r '.total_minutes_used // empty') || true
+            if [ -n "$included" ] && [ -n "$used" ]; then
+              remaining=$((included - used))
+              echo "included=$included" >> $GITHUB_OUTPUT
+              echo "used=$used" >> $GITHUB_OUTPUT
+              echo "remaining=$remaining" >> $GITHUB_OUTPUT
+            else
+              echo "warning=Billing API returned unexpected response; falling back" >> $GITHUB_OUTPUT
+              echo "included=30000" >> $GITHUB_OUTPUT
+              echo "used=0" >> $GITHUB_OUTPUT
+              echo "remaining=30000" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ORG_BILLING_TOKEN not set; attempting to use GITHUB_TOKEN (may lack permissions)"
+            resp=$(curl -sS -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/orgs/${{ github.repository_owner }}/settings/billing/actions" || true)
+            included=$(echo "$resp" | jq -r '.included_minutes // empty') || true
+            used=$(echo "$resp" | jq -r '.total_minutes_used // empty') || true
+            if [ -n "$included" ] && [ -n "$used" ]; then
+              remaining=$((included - used))
+              echo "included=$included" >> $GITHUB_OUTPUT
+              echo "used=$used" >> $GITHUB_OUTPUT
+              echo "remaining=$remaining" >> $GITHUB_OUTPUT
+            else
+              echo "Billing info not available; using fallback defaults" >> $GITHUB_OUTPUT
+              echo "included=30000" >> $GITHUB_OUTPUT
+              echo "used=0" >> $GITHUB_OUTPUT
+              echo "remaining=30000" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+
+      - name: Store Metrics
+        run: |
+          mkdir -p metrics
+          TIMESTAMP=$(date -Iseconds)
+          INCLUDED=${{ steps.billing.outputs.included }}
+          USED=${{ steps.billing.outputs.used }}
+          REMAINING=${{ steps.billing.outputs.remaining }}
+
+          # Calculate percentage (avoid division by zero)
+          if [ "$INCLUDED" -gt 0 ]; then
+            PERCENTAGE=$(echo "scale=2; $USED / $INCLUDED * 100" | bc 2>/dev/null || echo "0")
+          else
+            PERCENTAGE="0"
+          fi
+
+          cat > metrics/usage-${TIMESTAMP//:/-}.json << EOF
+          {
+            "timestamp": "$TIMESTAMP",
+            "included_minutes": $INCLUDED,
+            "used_minutes": $USED,
+            "remaining_minutes": $REMAINING,
+            "percentage_used": $PERCENTAGE
+          }
+          EOF
+
+          echo "📊 Usage metrics stored:"
+          cat metrics/usage-${TIMESTAMP//:/-}.json
+
+      - name: Commit to metrics branch
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          # Check if there are changes to commit
+          if git diff --quiet metrics/; then
+            echo "No changes to commit"
+          else
+            git add metrics/
+            git commit -m "📊 Track GitHub Actions usage - $(date)" || true
+
+            # Push to metrics branch (create if doesn't exist)
+            git push origin HEAD:metrics 2>/dev/null || \
+              (git checkout -b metrics && git push -u origin metrics)
+          fi
+
+      - name: Generate Summary Report
+        run: |
+          echo "## 📊 GitHub Actions Usage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Included Minutes | ${{ steps.billing.outputs.included }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Used Minutes | ${{ steps.billing.outputs.used }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Remaining Minutes | ${{ steps.billing.outputs.remaining }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Calculate percentage for display
+          INCLUDED=${{ steps.billing.outputs.included }}
+          USED=${{ steps.billing.outputs.used }}
+          if [ "$INCLUDED" -gt 0 ]; then
+            PERCENTAGE=$(echo "scale=1; $USED / $INCLUDED * 100" | bc 2>/dev/null || echo "0")
+            echo "**Usage:** ${PERCENTAGE}% of monthly allowance" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Last updated: $(date)*" >> $GITHUB_STEP_SUMMARY
